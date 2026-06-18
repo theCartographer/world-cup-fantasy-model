@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+
+data/raw/
+output/
+outputs/
+
+*.parquet
+*.xlsx
+*.xls
+*.txt
+
+# keep config files
+!config/team_aliases.csv
