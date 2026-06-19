@@ -21,6 +21,34 @@ python scripts/download_data.py
 python scripts/build_rankings.py --fixture-csv world-cup_2026.csv
 ```
 
+## BALLDONTLIE Optional Enrichment
+
+Set the API key in the current PowerShell session before running optional BALLDONTLIE downloads:
+
+```powershell
+$env:BALLDONTLIE_API_KEY = "<your-api-key>"
+```
+
+Keep that key out of source control and never commit it.
+
+Run a small test download first:
+
+```powershell
+python scripts/download_data.py --balldontlie --balldontlie-endpoints teams stadiums --balldontlie-rate-limit-seconds 13
+```
+
+Run the more useful World Cup endpoints with the same trial-safe delay:
+
+```powershell
+python scripts/download_data.py --balldontlie --balldontlie-endpoints players rosters player_injuries matches match_lineups match_events player_match_stats team_match_stats match_shots --balldontlie-rate-limit-seconds 13
+```
+
+Then flatten the downloaded JSON into processed CSV files:
+
+```powershell
+python scripts/flatten_balldontlie.py
+```
+
 With a current fantasy export. CSV exports are supported, and copied FIFA Fantasy
 player-list TXT exports like `Player / Total pts / Action` blocks are parsed too:
 

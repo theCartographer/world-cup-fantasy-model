@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import requests
 
@@ -25,6 +27,29 @@ WORLDCUP_API_STADIUMS_URLS = (
 )
 
 DYNAMIC_FIXTURE_FILENAME = "world-cup_2026.csv"
+
+BALLDONTLIE_BASE_URL = "https://api.balldontlie.io/fifa/worldcup/v1"
+BALLDONTLIE_OUTPUT_DIRNAME = "balldontlie"
+BALLDONTLIE_DEFAULT_RATE_LIMIT_SECONDS = 13.0
+
+BALLDONTLIE_ENDPOINTS: dict[str, dict[str, Any]] = {
+    "teams": {"path": "/teams", "season_param": True, "paginated": False},
+    "stadiums": {"path": "/stadiums", "season_param": True, "paginated": False},
+    "group_standings": {"path": "/group_standings", "season_param": True, "paginated": False},
+    "matches": {"path": "/matches", "season_param": True, "paginated": True},
+    "players": {"path": "/players", "season_param": True, "paginated": True},
+    "player_injuries": {"path": "/player_injuries", "season_param": True, "paginated": True},
+    "rosters": {"path": "/rosters", "season_param": True, "paginated": True},
+    "match_lineups": {"path": "/match_lineups", "season_param": False, "paginated": True},
+    "match_events": {"path": "/match_events", "season_param": False, "paginated": True},
+    "player_match_stats": {"path": "/player_match_stats", "season_param": False, "paginated": True},
+    "team_match_stats": {"path": "/team_match_stats", "season_param": False, "paginated": True},
+    "match_shots": {"path": "/match_shots", "season_param": False, "paginated": True},
+    "match_momentum": {"path": "/match_momentum", "season_param": False, "paginated": True},
+    "match_best_players": {"path": "/match_best_players", "season_param": False, "paginated": True},
+    "match_avg_positions": {"path": "/match_avg_positions", "season_param": False, "paginated": True},
+    "match_team_form": {"path": "/match_team_form", "season_param": False, "paginated": True},
+}
 
 @dataclass(frozen=True)
 class DataSource:
@@ -64,12 +89,12 @@ SOURCES: tuple[DataSource, ...] = (
     ),
     DataSource(
         name="cup26_probabilities_csv",
-        url="https://cup26matches.com/probabilities.csv",
+        url="https://cup26matches.com/data/probabilities.csv",
         filename="probabilities.csv",
     ),
     DataSource(
         name="cup26_probabilities_json",
-        url="https://cup26matches.com/probabilities.json",
+        url="https://cup26matches.com/data/probabilities.json",
         filename="probabilities.json",
     ),
     DataSource(
@@ -146,9 +171,7 @@ def download_all(
 
         manifest["sources"].append(record)
 
-    (raw_dir / "source_manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
+    write_source_manifest(raw_dir, manifest)
     return manifest
 
 def fetch_json(session: requests.Session, url: str, timeout: int) -> dict | list:
@@ -174,6 +197,187 @@ def fetch_json_with_fallbacks(
 
     raise RuntimeError("All API URLs failed: " + " | ".join(errors))
 
+
+def write_source_manifest(raw_dir: Path, manifest: dict[str, Any]) -> Path:
+    """Write the combined source manifest to disk."""
+    manifest_path = raw_dir / "source_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest_path
+
+
+def get_balldontlie_api_key() -> str:
+    """Read BALLDONTLIE API key from the environment."""
+    api_key = os.getenv("BALLDONTLIE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "BALLDONTLIE_API_KEY is not set. "
+            "Set it in the shell before running --balldontlie."
+        )
+    return api_key
+
+
+def sleep_for_rate_limit(seconds: float) -> None:
+    """Sleep between BALLDONTLIE requests to respect trial rate limits."""
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+def balldontlie_get(
+    session: requests.Session,
+    endpoint_name: str,
+    endpoint_config: dict[str, Any],
+    timeout: int,
+    season: int,
+    rate_limit_seconds: float,
+) -> dict[str, Any]:
+    """Fetch one BALLDONTLIE endpoint and keep the original data payload."""
+    url = f"{BALLDONTLIE_BASE_URL}{endpoint_config['path']}"
+    params: dict[str, Any] = {}
+
+    if endpoint_config.get("season_param"):
+        params["seasons[]"] = [season]
+
+    if endpoint_config.get("paginated"):
+        params["per_page"] = 100
+
+    all_rows: list[dict[str, Any]] = []
+    pages = 0
+    cursor: int | None = None
+
+    while True:
+        request_params = dict(params)
+        if cursor is not None:
+            request_params["cursor"] = cursor
+
+        response = session.get(url, params=request_params, timeout=timeout)
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            wait_seconds = float(retry_after) if retry_after else max(rate_limit_seconds, 15.0)
+            time.sleep(wait_seconds)
+            response = session.get(url, params=request_params, timeout=timeout)
+
+        response.raise_for_status()
+        payload = response.json()
+        pages += 1
+        print(f"BALLDONTLIE {endpoint_name}: fetched page {pages}")
+
+        rows = payload.get("data", [])
+        if isinstance(rows, list):
+            all_rows.extend(row for row in rows if isinstance(row, dict))
+
+        meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        next_cursor = meta.get("next_cursor") if isinstance(meta, dict) else None
+
+        if not endpoint_config.get("paginated") or not next_cursor:
+            break
+
+        cursor = int(next_cursor)
+        sleep_for_rate_limit(rate_limit_seconds)
+
+    return {
+        "endpoint": endpoint_name,
+        "url": url,
+        "season": season,
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+        "pages": pages,
+        "rows": len(all_rows),
+        "data": all_rows,
+    }
+
+
+def download_balldontlie_data(
+    raw_dir: Path,
+    endpoint_names: list[str],
+    timeout: int = 45,
+    season: int = 2026,
+    overwrite: bool = False,
+    rate_limit_seconds: float = BALLDONTLIE_DEFAULT_RATE_LIMIT_SECONDS,
+) -> dict[str, Any]:
+    """Download optional paid BALLDONTLIE World Cup enrichment data."""
+    api_key = get_balldontlie_api_key()
+    output_dir = raw_dir / BALLDONTLIE_OUTPUT_DIRNAME
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Authorization": api_key,
+            "User-Agent": "wc-fantasy-pandas-pipeline/1.0",
+        }
+    )
+
+    manifest: dict[str, Any] = {
+        "name": "balldontlie",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "season": season,
+        "rate_limit_seconds": rate_limit_seconds,
+        "endpoints": [],
+    }
+
+    endpoint_count = len(endpoint_names)
+
+    for index, endpoint_name in enumerate(endpoint_names):
+        endpoint_config = BALLDONTLIE_ENDPOINTS.get(endpoint_name)
+        destination = output_dir / f"{endpoint_name}.json"
+
+        record: dict[str, Any] = {
+            "endpoint": endpoint_name,
+            "filename": str(destination),
+            "status": "skipped",
+            "rows": 0,
+            "pages": 0,
+            "error": None,
+            "fetched_at_utc": None,
+        }
+
+        if endpoint_config is None:
+            record["status"] = "failed"
+            record["error"] = f"Unknown BALLDONTLIE endpoint: {endpoint_name}"
+            manifest["endpoints"].append(record)
+            continue
+
+        if destination.exists() and not overwrite:
+            record["status"] = "exists"
+            record["bytes"] = destination.stat().st_size
+            manifest["endpoints"].append(record)
+            continue
+
+        try:
+            payload = balldontlie_get(
+                session=session,
+                endpoint_name=endpoint_name,
+                endpoint_config=endpoint_config,
+                timeout=timeout,
+                season=season,
+                rate_limit_seconds=rate_limit_seconds,
+            )
+            destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            record["status"] = "downloaded"
+            record["rows"] = payload["rows"]
+            record["pages"] = payload["pages"]
+            record["bytes"] = destination.stat().st_size
+            record["fetched_at_utc"] = payload["fetched_at_utc"]
+
+        except requests.HTTPError as exc:
+            response = exc.response
+            status_code = response.status_code if response is not None else "unknown"
+            record["status"] = "failed"
+            record["error"] = f"HTTP {status_code}: {exc}"
+        except Exception as exc:
+            record["status"] = "failed"
+            record["error"] = str(exc)
+
+        manifest["endpoints"].append(record)
+
+        if index < endpoint_count - 1:
+            sleep_for_rate_limit(rate_limit_seconds)
+
+    manifest_path = output_dir / "balldontlie_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    return manifest
 
 def extract_records(payload: dict | list, possible_keys: tuple[str, ...]) -> list[dict]:
     """Extract list records from either a list response or a dict wrapper."""
@@ -391,10 +595,6 @@ def download_dynamic_fixtures(
         game_records = extract_records(games_payload, ("games", "data", "rows"))
         stadium_records = extract_records(stadiums_payload, ("stadiums", "data", "rows"))
 
-
-        game_records = extract_records(games_payload, ("games", "data", "rows"))
-        stadium_records = extract_records(stadiums_payload, ("stadiums", "data", "rows"))
-
         stadium_lookup = build_stadium_lookup(stadium_records)
         rows = convert_games_to_fixture_rows(game_records, stadium_lookup)
 
@@ -428,7 +628,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--convert-fixtures",
         action="store_true",
-        help="Convert downloaded rezarahiminia fixture CSV files into data/raw/world-cup_2026.csv.",
+        help="Download and convert dynamic fixtures into data/raw/world-cup_2026.csv.",
+    )
+    parser.add_argument(
+        "--balldontlie",
+        action="store_true",
+        help="Download optional paid BALLDONTLIE FIFA World Cup enrichment data.",
+    )
+    parser.add_argument(
+        "--balldontlie-endpoints",
+        nargs="+",
+        default=[
+            "players",
+            "rosters",
+            "player_injuries",
+            "matches",
+            "match_lineups",
+            "match_events",
+            "player_match_stats",
+            "team_match_stats",
+            "match_shots",
+        ],
+        choices=sorted(BALLDONTLIE_ENDPOINTS.keys()),
+        help="BALLDONTLIE endpoints to download.",
+    )
+    parser.add_argument(
+        "--balldontlie-season",
+        type=int,
+        default=2026,
+        choices=[2018, 2022, 2026],
+        help="World Cup season for BALLDONTLIE endpoints that support seasons[].",
+    )
+    parser.add_argument(
+        "--balldontlie-rate-limit-seconds",
+        type=float,
+        default=BALLDONTLIE_DEFAULT_RATE_LIMIT_SECONDS,
+        help="Delay between BALLDONTLIE requests. Use at least 12 seconds for GOAT trial.",
     )
     return parser
 
@@ -438,19 +673,29 @@ def main() -> int:
 
     manifest = download_all(args.raw_dir, overwrite=args.overwrite, timeout=args.timeout)
 
-    if args.fixtures:
+    if args.fixtures or args.convert_fixtures:
         fixture_record = download_dynamic_fixtures(args.raw_dir, timeout=args.timeout)
         manifest["dynamic_fixtures"] = fixture_record
+        write_source_manifest(args.raw_dir, manifest)
 
-        manifest_path = args.raw_dir / "source_manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if args.balldontlie:
+        balldontlie_manifest = download_balldontlie_data(
+            raw_dir=args.raw_dir,
+            endpoint_names=args.balldontlie_endpoints,
+            timeout=args.timeout,
+            season=args.balldontlie_season,
+            overwrite=args.overwrite,
+            rate_limit_seconds=args.balldontlie_rate_limit_seconds,
+        )
+        manifest["balldontlie"] = balldontlie_manifest
+        write_source_manifest(args.raw_dir, manifest)
 
     downloaded = sum(1 for source in manifest["sources"] if source["status"] == "downloaded")
     failed = [source for source in manifest["sources"] if source["status"] == "failed"]
 
     print(f"Downloaded {downloaded} files into {args.raw_dir}.")
 
-    if args.fixtures:
+    if args.fixtures or args.convert_fixtures:
         fixture_record = manifest["dynamic_fixtures"]
         if fixture_record["status"] == "downloaded":
             print(
@@ -459,13 +704,48 @@ def main() -> int:
                 f"({fixture_record['rows']} rows)."
             )
         else:
-            print("Dynamic fixtures could not be downloaded:")
+            print("Warning: dynamic fixtures could not be downloaded:")
             print(f"- {fixture_record['filename']}: {fixture_record['error']}")
-            return 1
 
-    if failed:
-        print("Some optional or required files could not be downloaded:")
-        for source in failed:
+    if args.balldontlie:
+        bdl_manifest = manifest["balldontlie"]
+        downloaded_bdl = [
+            endpoint for endpoint in bdl_manifest["endpoints"]
+            if endpoint["status"] == "downloaded"
+        ]
+        failed_bdl = [
+            endpoint for endpoint in bdl_manifest["endpoints"]
+            if endpoint["status"] == "failed"
+        ]
+
+        print(
+            f"Downloaded {len(downloaded_bdl)} BALLDONTLIE endpoints into "
+            f"{args.raw_dir / BALLDONTLIE_OUTPUT_DIRNAME}."
+        )
+
+        for endpoint in downloaded_bdl:
+            print(
+                f"- {endpoint['endpoint']}: "
+                f"{endpoint['rows']} rows across {endpoint['pages']} page(s)"
+            )
+
+        if failed_bdl:
+            print("Warning: some BALLDONTLIE endpoints failed:")
+            for endpoint in failed_bdl:
+                print(f"- {endpoint['endpoint']}: {endpoint['error']}")
+
+    failed_required = [source for source in failed if source["required"]]
+    failed_optional = [source for source in failed if not source["required"]]
+
+    if failed_required:
+        print("Required files could not be downloaded:")
+        for source in failed_required:
+            print(f"- {source['filename']}: {source['error']}")
+        return 1
+
+    if failed_optional:
+        print("Some optional files could not be downloaded:")
+        for source in failed_optional:
             print(f"- {source['filename']}: {source['error']}")
 
     return 0
