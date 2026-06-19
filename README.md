@@ -71,6 +71,14 @@ python scripts/build_rankings.py --fixture-csv data/raw/world-cup_2026.csv --cur
 python scripts/compare_rankings.py --baseline-csv output/baseline/player_rankings_all.csv --enriched-csv output/enriched/player_rankings_all.csv
 ```
 
+## Known limitations / model caveats
+
+- BALLDONTLIE enrichment is optional. If you do not pass `--balldontlie-features`, the open/static-data model remains the baseline.
+- BALLDONTLIE player stats can include historical context depending on endpoint coverage, so they are not guaranteed to reflect only current 2026 World Cup live form.
+- `live_form_score` is a first-pass enrichment signal, not the final fantasy answer.
+- Use `scripts/compare_rankings.py` to see how much the enriched rankings move from the baseline before trusting the adjustment.
+- Review injury status manually before making final fantasy decisions.
+
 With a current fantasy export. CSV exports are supported, and copied FIFA Fantasy
 player-list TXT exports like `Player / Total pts / Action` blocks are parsed too:
 
