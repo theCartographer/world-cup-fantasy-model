@@ -30,6 +30,21 @@ REPORT_COLUMNS = [
     "Risk note",
 ]
 
+BDL_REPORT_COLUMNS = [
+    "Player",
+    "Team",
+    "Position",
+    "balldontlie_player_id",
+    "live_form_score",
+    "bd_minutes",
+    "bd_starts",
+    "bd_goals",
+    "bd_assists",
+    "bd_xg",
+    "bd_xgot",
+    "bd_injury_status",
+]
+
 STARTING_LIKELIHOOD = {
     "likely starter": 1.0,
     "starter": 0.9,
@@ -331,6 +346,122 @@ def merge_current_export(players: pd.DataFrame, current_export: Path) -> pd.Data
     merged = merged.rename(columns={"match_method": "current_export_match_method"})
     merged = merged.drop(columns=[col for col in ["_player_row_id", "_current_record_id", "player_last_key"] if col in merged.columns])
     return apply_current_overrides(merged)
+
+
+def load_balldontlie_features(path: Path | None) -> pd.DataFrame:
+    """Read optional BALLDONTLIE enrichment features defensively."""
+    if path is None:
+        return pd.DataFrame()
+    if not path.exists():
+        print(f"Warning: BALLDONTLIE features file not found: {path}")
+        return pd.DataFrame()
+
+    frame = normalize_columns(read_table(path))
+    if frame.empty:
+        return frame
+
+    player_col = first_present(frame, ["player_name", "name"])
+    team_col = first_present(frame, ["team_name", "team", "country_name"])
+    if player_col is None or team_col is None:
+        print(f"Warning: BALLDONTLIE features file {path} is missing player_name or team_name.")
+        return pd.DataFrame()
+
+    work = frame.copy()
+    work["bd_player_key"] = work[player_col].map(normalize_player_name)
+    work["bd_team_key"] = work[team_col].map(normalize_team)
+    if "position" in work.columns:
+        work["bd_position_key"] = work["position"].astype("string").str.upper()
+
+    if "balldontlie_player_id" in work.columns:
+        work["balldontlie_player_id"] = clean_id(work["balldontlie_player_id"])
+
+    numeric_columns = [
+        "live_form_score",
+        "matches_in_stats",
+        "lineup_rows",
+        "starts",
+        "minutes",
+        "goals",
+        "assists",
+        "yellow_cards",
+        "red_cards",
+        "shots",
+        "shots_on_target",
+        "xg",
+        "xgot",
+    ]
+    for column in numeric_columns:
+        if column in work.columns:
+            work[column] = pd.to_numeric(work[column], errors="coerce")
+
+    rename_map = {
+        "minutes": "bd_minutes",
+        "starts": "bd_starts",
+        "goals": "bd_goals",
+        "assists": "bd_assists",
+        "xg": "bd_xg",
+        "xgot": "bd_xgot",
+        "injury_status": "bd_injury_status",
+        "injury_description": "bd_injury_description",
+        "lineup_rows": "bd_lineup_rows",
+        "matches_in_stats": "bd_matches_in_stats",
+        "shots": "bd_shots",
+        "shots_on_target": "bd_shots_on_target",
+        "yellow_cards": "bd_yellow_cards",
+        "red_cards": "bd_red_cards",
+    }
+    for source, target in rename_map.items():
+        if source in work.columns:
+            work[target] = work[source]
+
+    work = work.drop_duplicates(subset=["bd_player_key", "bd_team_key"], keep="first")
+    return work
+
+
+def attach_balldontlie_features(players: pd.DataFrame, features_path: Path | None) -> pd.DataFrame:
+    """Join optional BALLDONTLIE enrichment data onto the ranking table."""
+    features = load_balldontlie_features(features_path)
+    if features.empty:
+        return players
+
+    out = players.copy()
+    if "player_name_standardized" not in out.columns:
+        out["player_name_standardized"] = out.get("display_name", pd.Series("", index=out.index)).map(normalize_player_name)
+    if "team_key" not in out.columns:
+        out["team_key"] = out.get("team", pd.Series("", index=out.index)).map(normalize_team)
+
+    feature_columns = [
+        "balldontlie_player_id",
+        "live_form_score",
+        "bd_minutes",
+        "bd_starts",
+        "bd_goals",
+        "bd_assists",
+        "bd_xg",
+        "bd_xgot",
+        "bd_injury_status",
+        "bd_injury_description",
+        "bd_lineup_rows",
+        "bd_matches_in_stats",
+        "bd_shots",
+        "bd_shots_on_target",
+        "bd_yellow_cards",
+        "bd_red_cards",
+    ]
+    feature_subset = [col for col in feature_columns if col in features.columns]
+    features = features[["bd_player_key", "bd_team_key", *feature_subset]].drop_duplicates(
+        subset=["bd_player_key", "bd_team_key"],
+        keep="first",
+    )
+
+    merged = out.merge(
+        features,
+        left_on=["player_name_standardized", "team_key"],
+        right_on=["bd_player_key", "bd_team_key"],
+        how="left",
+    )
+    merged = merged.drop(columns=[col for col in ["bd_player_key", "bd_team_key"] if col in merged.columns])
+    return merged
 
 
 def prepare_current_export(current: pd.DataFrame) -> pd.DataFrame:
@@ -987,6 +1118,10 @@ def attach_context(players: pd.DataFrame, fixtures: pd.DataFrame, strength: pd.D
 
 def score_players(players: pd.DataFrame) -> pd.DataFrame:
     out = players.copy()
+    BDL_LIVE_FORM_WEIGHT = 2.0
+    BDL_OUT_INJURY_PENALTY = 2.5
+    BDL_ACTIVE_INJURY_PENALTY = 1.0
+
     numeric_defaults = {
         "goals_per90": 0,
         "assists_per90": 0,
@@ -1118,6 +1253,23 @@ def score_players(players: pd.DataFrame) -> pd.DataFrame:
         out["current_form_raw"] = 0
     out["current_form_score"] = minmax_by_position(out, "current_form_raw").fillna(0.5)
 
+    if "live_form_score" in out.columns:
+        live_form = pd.to_numeric(out["live_form_score"], errors="coerce")
+        out["bd_live_form_signal"] = minmax(live_form).fillna(0.5)
+    else:
+        out["bd_live_form_signal"] = 0.5
+
+    if "bd_injury_status" in out.columns:
+        injury_text = out["bd_injury_status"].astype("string").str.strip().str.lower()
+    else:
+        injury_text = pd.Series("", index=out.index, dtype="string")
+
+    active_injury_mask = injury_text.notna() & ~injury_text.isin({"", "nan", "none", "available", "fit", "active", "healthy"})
+    out["bd_injury_penalty"] = 0.0
+    out.loc[active_injury_mask, "bd_injury_penalty"] = BDL_ACTIVE_INJURY_PENALTY
+    out.loc[injury_text.str.contains("out", na=False), "bd_injury_penalty"] = BDL_OUT_INJURY_PENALTY
+    out["bd_live_form_adjustment"] = (BDL_LIVE_FORM_WEIGHT * (out["bd_live_form_signal"] - 0.5)) - out["bd_injury_penalty"]
+
     out["pre_penalty_score"] = (
         100
         * (
@@ -1129,6 +1281,7 @@ def score_players(players: pd.DataFrame) -> pd.DataFrame:
             + 0.05 * out["current_form_score"]
         )
     )
+    out["pre_penalty_score"] = out["pre_penalty_score"] + out["bd_live_form_adjustment"].fillna(0)
     out["fantasy_shortlist_score"] = (out["pre_penalty_score"] * out["starting_penalty"]).round(2)
     out["final_score"] = out["fantasy_shortlist_score"]
 
@@ -1222,6 +1375,22 @@ def export_rankings(scored: pd.DataFrame, output_dir: Path) -> dict[str, Path]:
         "position",
         "team",
         "team_standardized",
+        "balldontlie_player_id",
+        "live_form_score",
+        "bd_minutes",
+        "bd_starts",
+        "bd_goals",
+        "bd_assists",
+        "bd_xg",
+        "bd_xgot",
+        "bd_injury_status",
+        "bd_injury_description",
+        "bd_lineup_rows",
+        "bd_matches_in_stats",
+        "bd_shots",
+        "bd_shots_on_target",
+        "bd_yellow_cards",
+        "bd_red_cards",
         "fantasy_price",
         "fantasy_price_original",
         "fantasy_price_source",
@@ -1339,6 +1508,7 @@ def write_report(
     report_md: Path | None = None,
     alias_file: Path | None = None,
     team_strength_csv: Path | None = None,
+    balldontlie_features_csv: Path | None = None,
 ) -> Path:
     report_path = report_md or (output_dir / "fantasy_shortlist_report.md")
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1368,9 +1538,12 @@ def write_report(
         alias_file,
         team_strength_csv,
         custom_strength_used,
+        balldontlie_features_csv,
     )
     warning_lines = build_team_match_warning_lines(report_frame, fixtures)
     strength_warning_lines = build_team_strength_warning_lines(report_frame, strength, team_strength_csv)
+    bdl_used = balldontlie_features_csv is not None
+    bdl_lines = build_balldontlie_feature_lines(balldontlie_features_csv, scored) if bdl_used else []
     parts = [
         "# FIFA World Cup Fantasy Shortlist",
         "",
@@ -1400,11 +1573,28 @@ def write_report(
         "## Team Strength Warnings",
         "",
         *strength_warning_lines,
-        "",
-        "## Top 10 Overall Players",
-        "",
-        markdown_table(report_frame, REPORT_COLUMNS, 10),
     ]
+
+    if bdl_used:
+        parts.extend(
+            [
+                "",
+                "## BALLDONTLIE Enrichment",
+                "",
+                *bdl_lines,
+                "",
+                markdown_table(report_frame, BDL_REPORT_COLUMNS, 10),
+            ]
+        )
+
+    parts.extend(
+        [
+            "",
+            "## Top 10 Overall Players",
+            "",
+            markdown_table(report_frame, REPORT_COLUMNS, 10),
+        ]
+    )
 
     position_limits = {"GK": 5, "DEF": 10, "MID": 10, "FWD": 10}
     for position, limit in position_limits.items():
@@ -1502,6 +1692,30 @@ def add_report_metrics(report_frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_balldontlie_feature_lines(features_csv: Path | None, scored: pd.DataFrame) -> list[str]:
+    lines = [
+        "- Optional player-level BALLDONTLIE enrichment is enabled, but the baseline still comes from open/static data.",
+        "- `live_form_score` is a first-pass signal and should not be treated as the final ranking model.",
+    ]
+    if features_csv is not None:
+        lines.insert(0, f"- BALLDONTLIE features file: `{features_csv}`")
+        if features_csv.exists():
+            modified = datetime.fromtimestamp(features_csv.stat().st_mtime, timezone.utc).isoformat()
+            lines.append(f"- BALLDONTLIE features file modified UTC: `{modified}`")
+        else:
+            lines.append("- BALLDONTLIE features file was provided but not found.")
+
+    if "live_form_score" in scored.columns:
+        top_players = scored.loc[scored["live_form_score"].notna()].sort_values("live_form_score", ascending=False).head(5)
+    else:
+        top_players = pd.DataFrame()
+    if not top_players.empty:
+        lines.append("- Top enriched players are shown below for quick review.")
+    else:
+        lines.append("- No usable BALLDONTLIE enrichment rows were matched to ranked players.")
+    return lines
+
+
 def build_team_match_warning_lines(scored: pd.DataFrame, fixtures: pd.DataFrame) -> list[str]:
     """Report teams that still fail to connect after alias normalization."""
     lines: list[str] = []
@@ -1579,6 +1793,7 @@ def build_source_lines(
     alias_file: Path | None = None,
     team_strength_csv: Path | None = None,
     custom_strength_used: bool = False,
+    balldontlie_features_csv: Path | None = None,
 ) -> list[str]:
     lines = [f"- Fixture file: `{fixture_csv}`"]
     if fixture_csv.exists():
@@ -1620,6 +1835,15 @@ def build_source_lines(
     else:
         lines.append("- Custom team-strength CSV: not provided; using built-in/open strength sources when available.")
 
+    if balldontlie_features_csv:
+        lines.append(f"- BALLDONTLIE features CSV: `{balldontlie_features_csv}`")
+        if balldontlie_features_csv.exists():
+            modified = datetime.fromtimestamp(balldontlie_features_csv.stat().st_mtime, timezone.utc).isoformat()
+            lines.append(f"- BALLDONTLIE features CSV modified UTC: `{modified}`")
+            lines.append("- BALLDONTLIE enrichment is optional player-level data layered on top of the open/static baseline.")
+            lines.append("- `live_form_score` is a first-pass signal and should not be treated as the final ranking model.")
+        else:
+            lines.append("- BALLDONTLIE features CSV was provided but not found.")
     if manifest:
         lines.append(f"- Download manifest generated UTC: `{manifest.get('generated_at_utc', 'unknown')}`")
         for source in manifest.get("sources", []):
@@ -1650,6 +1874,7 @@ def run_pipeline(
     report_md: Path | None = None,
     alias_file: Path | None = Path("config/team_aliases.csv"),
     team_strength_csv: Path | None = None,
+    balldontlie_features_csv: Path | None = None,
     download_missing: bool = True,
     overwrite_downloads: bool = False,
 ) -> dict[str, Any]:
@@ -1682,6 +1907,7 @@ def run_pipeline(
     fixtures = load_fixtures(fixture_csv, as_of_ts, target_round=target_round)
     strength = load_strength(raw_dir, team_strength_csv=team_strength_csv)
     contextual = attach_context(players, fixtures, strength)
+    contextual = attach_balldontlie_features(contextual, balldontlie_features_csv)
     scored = score_players(contextual)
     ranking_paths = export_rankings(scored, output_dir)
     report_path = write_report(
@@ -1698,6 +1924,7 @@ def run_pipeline(
         report_md,
         alias_file,
         team_strength_csv,
+        balldontlie_features_csv,
     )
 
     return {
@@ -1716,6 +1943,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-md", type=Path, help="Markdown report path, for example outputs/matchday_2_report.md.")
     parser.add_argument("--team-aliases", type=Path, default=Path("config/team_aliases.csv"), help="CSV with alias,canonical columns for team-name normalization.")
     parser.add_argument("--team-strength-csv", type=Path, help="Optional CSV with team, strength_score, and optional match/team projection columns.")
+    parser.add_argument("--balldontlie-features", type=Path, help="Optional CSV with BALLDONTLIE player_live_features.csv enrichment.")
     # --as-of is the rolling mode: matches before this timestamp are treated as
     # played, and each player gets the next unplayed fixture for their team.
     parser.add_argument("--as-of", help="Fixture cutoff timestamp, for example 2026-06-18 or 2026-06-18T12:00:00Z.")
@@ -1739,6 +1967,7 @@ def main() -> int:
         report_md=args.report_md,
         alias_file=args.team_aliases,
         team_strength_csv=args.team_strength_csv,
+        balldontlie_features_csv=args.balldontlie_features,
         download_missing=not args.no_download,
         overwrite_downloads=args.overwrite_downloads,
     )

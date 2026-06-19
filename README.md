@@ -49,6 +49,20 @@ Then flatten the downloaded JSON into processed CSV files:
 python scripts/flatten_balldontlie.py
 ```
 
+Build the optional player-level feature layer from those flattened files:
+
+```powershell
+python scripts/build_balldontlie_features.py
+```
+
+This creates optional live/player-level enrichment only. It is not wired into the final ranking/scoring pipeline yet.
+
+To include those optional features in rankings, pass the enrichment CSV:
+
+```powershell
+python scripts/build_rankings.py --fixture-csv data/raw/world-cup_2026.csv --current-export "C:\Users\micha\Downloads\fantasy_football_players.txt" --target-round 2 --team-aliases config/team_aliases.csv --balldontlie-features data/processed/balldontlie/player_live_features.csv --report-md outputs/matchday_2_report.md
+```
+
 With a current fantasy export. CSV exports are supported, and copied FIFA Fantasy
 player-list TXT exports like `Player / Total pts / Action` blocks are parsed too:
 
