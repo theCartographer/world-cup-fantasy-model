@@ -79,6 +79,22 @@ python scripts/compare_rankings.py --baseline-csv output/baseline/player_ranking
 - Use `scripts/compare_rankings.py` to see how much the enriched rankings move from the baseline before trusting the adjustment.
 - Review injury status manually before making final fantasy decisions.
 
+## Current Squad Workflow
+
+Copy [`config/current_squad_template.csv`](/C:/Users/micha/OneDrive/Documents/Fantasy%20Football/config/current_squad_template.csv) to `data/manual/current_squad.csv`, then edit it whenever your fantasy squad changes.
+
+Review the current locked round:
+
+```powershell
+python scripts/pick_xi.py --rankings-csv output/player_rankings_balldontlie.csv --current-squad-csv data/manual/current_squad.csv --mode review --output-md outputs/current_squad_review.md
+```
+
+Plan the next round:
+
+```powershell
+python scripts/pick_xi.py --rankings-csv output/player_rankings_balldontlie.csv --current-squad-csv data/manual/current_squad.csv --mode plan --formation 3-4-3 --budget 100 --max-per-team 3 --free-transfers 2 --output-md outputs/suggested_xi.md
+```
+
 With a current fantasy export. CSV exports are supported, and copied FIFA Fantasy
 player-list TXT exports like `Player / Total pts / Action` blocks are parsed too:
 
@@ -187,3 +203,17 @@ single extreme historical field does not dominate. Fixture score uses Elo
 difference when both teams have Elo; otherwise it stays neutral at `0.5` with
 fixture difficulty `3`. Each component is exported so the score can be inspected
 and adjusted.
+
+`expected_fantasy_points` is a separate rules-based estimate derived from the
+fantasy scoring system in `config/fantasy_scoring_rules.json`. It is a better
+starting point for squad selection, while `final_score` remains useful as a
+broad ranking and confidence signal. You can point the pipeline at a custom
+rules file with `--scoring-rules`.
+
+When BALLDONTLIE enrichment is available, `expected_fantasy_points` also uses
+current tournament minutes and recent starts to penalize players who are not
+actually playing, especially goalkeepers.
+
+```powershell
+python scripts/build_rankings.py --fixture-csv world-cup_2026.csv --scoring-rules config/fantasy_scoring_rules.json
+```

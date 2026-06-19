@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,22 @@ REPORT_COLUMNS = [
     "Risk note",
 ]
 
+EXPECTED_REPORT_COLUMNS = [
+    "Player",
+    "Position",
+    "Team",
+    "Opponent",
+    "Price",
+    "Expected fantasy points",
+    "expected_minutes_probability",
+    "expected_start_probability",
+    "expected_playing_time_warning",
+    "Final score",
+    "Fixture difficulty",
+    "Starting likelihood",
+    "Risk note",
+]
+
 BDL_REPORT_COLUMNS = [
     "Player",
     "Team",
@@ -46,6 +63,14 @@ BDL_REPORT_COLUMNS = [
     "bd_xgot",
     "bd_injury_status",
     "bd_injury_description",
+    "bd_minutes_total",
+    "bd_matches_played",
+    "bd_starts_total",
+    "bd_minutes_last_match",
+    "bd_started_last_match",
+    "bd_appearance_rate",
+    "bd_start_rate",
+    "bd_has_current_minutes_data",
 ]
 
 STARTING_LIKELIHOOD = {
@@ -62,6 +87,19 @@ STARTING_PENALTIES = {
     "Maybe Starter": 0.85,
     "Unknown": 0.80,
     "Unlikely Starter": 0.60,
+}
+
+DEFAULT_FANTASY_SCORING_RULES = {
+    "appearance": {"up_to_60": 1, "sixty_plus": 1},
+    "goals": {"GK": 9, "DEF": 7, "MID": 6, "FWD": 5},
+    "assist": 3,
+    "clean_sheet": {"GK": 5, "DEF": 5, "MID": 1, "FWD": 0},
+    "saves": {"gk_every_3": 1, "gk_penalty_save": 3},
+    "cards": {"yellow": -1, "red": -2, "own_goal": -2},
+    "penalties": {"won": 2, "conceded": -1},
+    "direct_free_kick_goal": 1,
+    "scouting_bonus": {"threshold_points": 4, "threshold_selected_pct": 5, "bonus": 2},
+    "defensive_bonus": {"mid_tackles_every": 3, "mid_chances_created_every": 2, "fwd_shots_on_target_every": 2},
 }
 
 TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252")
@@ -444,6 +482,23 @@ def attach_balldontlie_features(players: pd.DataFrame, features_path: Path | Non
         "bd_xgot",
         "bd_injury_status",
         "bd_injury_description",
+        "bd_minutes_total",
+        "bd_matches_played",
+        "bd_starts_total",
+        "bd_minutes_last_match",
+        "bd_started_last_match",
+        "bd_appearance_rate",
+        "bd_start_rate",
+        "bd_has_current_minutes_data",
+        "expected_appearance_points",
+        "expected_goal_points",
+        "expected_assist_points",
+        "expected_clean_sheet_points",
+        "expected_saves_points",
+        "expected_defensive_bonus_points",
+        "expected_card_penalty",
+        "expected_scouting_bonus_points",
+        "expected_fantasy_points",
         "bd_lineup_rows",
         "bd_matches_in_stats",
         "bd_shots",
@@ -1119,7 +1174,7 @@ def attach_context(players: pd.DataFrame, fixtures: pd.DataFrame, strength: pd.D
     return out
 
 
-def score_players(players: pd.DataFrame) -> pd.DataFrame:
+def score_players(players: pd.DataFrame, scoring_rules: dict[str, Any] | None = None) -> pd.DataFrame:
     out = players.copy()
     # First-pass BALLDONTLIE enrichment only: keep the signal bounded so it can
     # nudge the ranking without overpowering the open-data baseline.
@@ -1259,6 +1314,10 @@ def score_players(players: pd.DataFrame) -> pd.DataFrame:
         out["current_form_raw"] = 0
     out["current_form_score"] = minmax_by_position(out, "current_form_raw").fillna(0.5)
 
+    if scoring_rules is None:
+        scoring_rules = deepcopy(DEFAULT_FANTASY_SCORING_RULES)
+    out = expected_fantasy_points_frame(out, scoring_rules)
+
     bd_adjustment = pd.Series(0.0, index=out.index)
     has_balldontlie = False
     if "live_form_score" in out.columns:
@@ -1349,6 +1408,255 @@ def optional_team_signal(
     return values.fillna(fallback).clip(0, 1)
 
 
+def deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge_dict(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load_scoring_rules(path: Path | None) -> dict[str, Any]:
+    rules = deepcopy(DEFAULT_FANTASY_SCORING_RULES)
+    if path is None or not path.exists():
+        return rules
+    try:
+        loaded = json.loads(read_text_with_fallback(path))
+    except (json.JSONDecodeError, OSError):
+        return rules
+    if isinstance(loaded, dict):
+        deep_merge_dict(rules, loaded)
+    return rules
+
+
+def numeric_series(df: pd.DataFrame, column: str | None, default: float = 0.0) -> pd.Series:
+    if column is None or column not in df.columns:
+        return pd.Series(default, index=df.index, dtype="float64")
+    return pd.to_numeric(series_from_column(df, column), errors="coerce").fillna(default)
+
+
+def rate_from_candidates(df: pd.DataFrame, candidates: list[str], denominator: pd.Series | None = None, default: float = 0.0) -> pd.Series:
+    source = first_present(df, candidates)
+    if source is None:
+        return pd.Series(default, index=df.index, dtype="float64")
+    values = pd.to_numeric(series_from_column(df, source), errors="coerce").fillna(default)
+    if "per90" in source:
+        return values.clip(lower=0)
+    if denominator is None:
+        return values.clip(lower=0)
+    denom = pd.to_numeric(denominator, errors="coerce").replace(0, pd.NA)
+    return (values / denom).fillna(default).clip(lower=0)
+
+
+def series_from_column(df: pd.DataFrame, column: str | None) -> pd.Series:
+    if column is None or column not in df.columns:
+        return pd.Series(pd.NA, index=df.index)
+    value = df.loc[:, column]
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return pd.Series(pd.NA, index=df.index)
+        value = value.iloc[:, 0]
+    return value
+
+
+def boolean_series_from_column(df: pd.DataFrame, column: str | None, default: bool = False) -> pd.Series:
+    if column is None or column not in df.columns:
+        return pd.Series(default, index=df.index, dtype="boolean")
+    values = series_from_column(df, column).astype("string").str.strip().str.lower()
+    truthy = values.isin({"true", "1", "yes", "y", "t"})
+    return truthy.fillna(default).astype("boolean")
+
+
+def expected_fantasy_points_frame(out: pd.DataFrame, scoring_rules: dict[str, Any]) -> pd.DataFrame:
+    work = out.copy()
+    position = series_from_column(work, "position").astype("string").str.upper().fillna("UNK")
+    work["position"] = position
+
+    minutes_proxy = numeric_series(work, "minutes_score", 0.5).clip(0, 1)
+    starting_proxy = numeric_series(work, "starting_likelihood_score", 0.4).clip(0, 1)
+    historical_start_proxy = numeric_series(work, "historical_start_rate", 0).clip(0, 1)
+    current_minutes_flag = boolean_series_from_column(work, "bd_has_current_minutes_data", False)
+    current_minutes_total = numeric_series(work, "bd_minutes_total", 0).clip(lower=0)
+    current_matches_played = numeric_series(work, "bd_matches_played", 0).clip(lower=0)
+    current_starts_total = numeric_series(work, "bd_starts_total", 0).clip(lower=0)
+    current_minutes_last = numeric_series(work, "bd_minutes_last_match", 0).clip(lower=0)
+    current_started_last = boolean_series_from_column(work, "bd_started_last_match", False)
+    current_appearance_rate = numeric_series(work, "bd_appearance_rate", 0).clip(0, 1)
+    current_start_rate = numeric_series(work, "bd_start_rate", 0).clip(0, 1)
+    current_volume_rate = (current_minutes_total / (current_matches_played.replace(0, pd.NA) * 90)).fillna(0).clip(0, 1)
+    current_start_ratio = (current_starts_total / current_matches_played.replace(0, pd.NA)).fillna(0).clip(0, 1)
+    current_appearance_rate = current_appearance_rate.where(current_appearance_rate.gt(0), current_volume_rate)
+    current_start_rate = current_start_rate.where(current_start_rate.gt(0), current_start_ratio)
+
+    expected_minutes_probability = (0.45 * minutes_proxy + 0.25 * current_appearance_rate + 0.20 * current_start_rate + 0.10 * current_volume_rate).clip(0, 1)
+    expected_start_probability = (
+        0.40 * starting_proxy
+        + 0.25 * historical_start_proxy
+        + 0.20 * current_start_rate
+        + 0.15 * current_start_ratio
+    ).clip(0, 1)
+
+    recent_full_match = current_minutes_flag & current_minutes_last.ge(60)
+    no_recent_minutes = current_minutes_flag & current_minutes_last.le(0) & current_starts_total.le(0)
+    expected_minutes_probability = expected_minutes_probability.where(
+        ~recent_full_match,
+        expected_minutes_probability.clip(lower=0.85),
+    )
+    expected_start_probability = expected_start_probability.where(
+        ~recent_full_match,
+        expected_start_probability.clip(lower=0.75),
+    )
+    expected_minutes_probability = expected_minutes_probability.where(
+        ~no_recent_minutes,
+        (expected_minutes_probability * 0.25).clip(0, 1),
+    )
+    expected_start_probability = expected_start_probability.where(
+        ~no_recent_minutes,
+        (expected_start_probability * 0.15).clip(0, 1),
+    )
+    expected_minutes_probability = expected_minutes_probability.where(
+        ~(current_minutes_flag & current_started_last & current_minutes_last.gt(0)),
+        expected_minutes_probability.clip(lower=0.65),
+    )
+
+    playing_time_multiplier = expected_minutes_probability.clip(0, 1)
+    appearance_60_prob = playing_time_multiplier
+    appearance_60plus_prob = expected_start_probability.clip(0, 1)
+    work["expected_appearance_points"] = (
+        appearance_60_prob * float(scoring_rules["appearance"].get("up_to_60", 1))
+        + appearance_60plus_prob * float(scoring_rules["appearance"].get("sixty_plus", 1))
+    )
+
+    matches_denominator = numeric_series(work, "bd_matches_in_stats", 0)
+    if matches_denominator.eq(0).all():
+        matches_denominator = numeric_series(work, "hist_games", 0)
+    matches_denominator = matches_denominator.replace(0, pd.NA)
+
+    goals_rate = rate_from_candidates(work, ["goals_per90"], default=0.0)
+    bd_goals_rate = rate_from_candidates(work, ["bd_goals"], denominator=matches_denominator, default=0.0)
+    bd_xg_rate = rate_from_candidates(work, ["bd_xg"], denominator=matches_denominator, default=0.0)
+    bd_xgot_rate = rate_from_candidates(work, ["bd_xgot"], denominator=matches_denominator, default=0.0)
+    goals_rate = goals_rate.where(goals_rate > 0, bd_goals_rate + 0.25 * bd_xg_rate + 0.10 * bd_xgot_rate)
+
+    assists_rate = rate_from_candidates(work, ["assists_per90"], default=0.0)
+    bd_assists_rate = rate_from_candidates(work, ["bd_assists"], denominator=matches_denominator, default=0.0)
+    assists_rate = assists_rate.where(assists_rate > 0, bd_assists_rate)
+
+    goalie = work["position"].eq("GK")
+    defender = work["position"].eq("DEF")
+    midfielder = work["position"].eq("MID")
+    forward = work["position"].eq("FWD")
+
+    goal_points = pd.Series(0.0, index=work.index)
+    goal_points.loc[goalie] = float(scoring_rules["goals"].get("GK", 9))
+    goal_points.loc[defender] = float(scoring_rules["goals"].get("DEF", 7))
+    goal_points.loc[midfielder] = float(scoring_rules["goals"].get("MID", 6))
+    goal_points.loc[forward] = float(scoring_rules["goals"].get("FWD", 5))
+    goal_points.loc[~(goalie | defender | midfielder | forward)] = float(scoring_rules["goals"].get("MID", 6))
+
+    work["expected_goal_points"] = goals_rate * playing_time_multiplier * goal_points
+    work["expected_assist_points"] = assists_rate * playing_time_multiplier * float(scoring_rules.get("assist", 3))
+
+    team_defense = numeric_series(work, "team_defense_score", 0.5).clip(0, 1)
+    fixture_score = numeric_series(work, "fixture_score", 0.5).clip(0, 1)
+    clean_sheet_prob = (0.65 * team_defense + 0.35 * fixture_score).clip(0, 1)
+    clean_sheet_points = pd.Series(0.0, index=work.index)
+    clean_sheet_points.loc[goalie] = float(scoring_rules["clean_sheet"].get("GK", 5))
+    clean_sheet_points.loc[defender] = float(scoring_rules["clean_sheet"].get("DEF", 5))
+    clean_sheet_points.loc[midfielder] = float(scoring_rules["clean_sheet"].get("MID", 1))
+    clean_sheet_points.loc[forward] = float(scoring_rules["clean_sheet"].get("FWD", 0))
+    work["expected_clean_sheet_points"] = clean_sheet_prob * clean_sheet_points * playing_time_multiplier
+
+    saves_rate = rate_from_candidates(work, ["saves_per90"], default=0.0)
+    work["expected_saves_points"] = (
+        goalie.astype(float)
+        * saves_rate
+        * playing_time_multiplier
+        / 3.0
+        * float(scoring_rules["saves"].get("gk_every_3", 1))
+    )
+
+    tackles_rate = rate_from_candidates(work, ["tackles_per90"], default=0.0)
+    chances_rate = rate_from_candidates(work, ["chances_created_per90", "key_passes_per90", "chances_created", "key_passes"], denominator=matches_denominator, default=0.0)
+    shots_on_target_rate = rate_from_candidates(work, ["shots_on_target", "bd_shots_on_target"], denominator=matches_denominator, default=0.0)
+
+    defensive_bonus = pd.Series(0.0, index=work.index)
+    defensive_bonus.loc[midfielder] += tackles_rate.loc[midfielder] * playing_time_multiplier.loc[midfielder] / float(scoring_rules["defensive_bonus"].get("mid_tackles_every", 3))
+    defensive_bonus.loc[midfielder] += chances_rate.loc[midfielder] * playing_time_multiplier.loc[midfielder] / float(scoring_rules["defensive_bonus"].get("mid_chances_created_every", 2))
+    defensive_bonus.loc[forward] += shots_on_target_rate.loc[forward] * playing_time_multiplier.loc[forward] / float(scoring_rules["defensive_bonus"].get("fwd_shots_on_target_every", 2))
+    work["expected_defensive_bonus_points"] = defensive_bonus
+
+    card_penalty = pd.Series(0.0, index=work.index)
+    yellow_rate = rate_from_candidates(work, ["yellow_cards", "bd_yellow_cards"], denominator=matches_denominator, default=0.0)
+    red_rate = rate_from_candidates(work, ["red_cards", "bd_red_cards"], denominator=matches_denominator, default=0.0)
+    card_penalty += yellow_rate * float(scoring_rules["cards"].get("yellow", -1)) * playing_time_multiplier
+    card_penalty += red_rate * float(scoring_rules["cards"].get("red", -2)) * playing_time_multiplier
+    own_goal_rate = rate_from_candidates(work, ["own_goals", "own_goal", "bd_own_goals"], denominator=matches_denominator, default=0.0)
+    card_penalty += own_goal_rate * float(scoring_rules["cards"].get("own_goal", -2)) * playing_time_multiplier
+    work["expected_card_penalty"] = card_penalty
+
+    misc_points = pd.Series(0.0, index=work.index)
+    winning_penalty_rate = rate_from_candidates(work, ["penalties_won", "penalty_wins", "won_penalties"], denominator=matches_denominator, default=0.0)
+    misc_points += winning_penalty_rate * float(scoring_rules["penalties"].get("won", 2)) * playing_time_multiplier
+    conceded_penalty_rate = rate_from_candidates(work, ["penalties_conceded", "penalties_committed", "conceded_penalties"], denominator=matches_denominator, default=0.0)
+    misc_points += conceded_penalty_rate * float(scoring_rules["penalties"].get("conceded", -1)) * playing_time_multiplier
+    direct_fk_rate = rate_from_candidates(work, ["direct_free_kick_goals", "free_kick_goals", "fk_goals"], denominator=matches_denominator, default=0.0)
+    misc_points += direct_fk_rate * float(scoring_rules.get("direct_free_kick_goal", 1)) * playing_time_multiplier
+    work["expected_misc_points"] = misc_points
+
+    work["expected_fantasy_points_base"] = (
+        work["expected_appearance_points"]
+        + work["expected_goal_points"]
+        + work["expected_assist_points"]
+        + work["expected_clean_sheet_points"]
+        + work["expected_saves_points"]
+        + work["expected_defensive_bonus_points"]
+        + work["expected_card_penalty"]
+        + work["expected_misc_points"]
+    )
+
+    percent_selected = numeric_series(work, "percent_selected", 100).clip(lower=0)
+    scouting_threshold = float(scoring_rules["scouting_bonus"].get("threshold_points", 4))
+    scouting_selected_threshold = float(scoring_rules["scouting_bonus"].get("threshold_selected_pct", 5))
+    scouting_bonus = pd.Series(0.0, index=work.index)
+    scouting_bonus_mask = work["expected_fantasy_points_base"].gt(scouting_threshold) & percent_selected.lt(scouting_selected_threshold)
+    scouting_bonus.loc[scouting_bonus_mask] = float(scoring_rules["scouting_bonus"].get("bonus", 2)) * 0.25
+    work["expected_scouting_bonus_points"] = scouting_bonus
+
+    work["expected_fantasy_points"] = (work["expected_fantasy_points_base"] + work["expected_scouting_bonus_points"]).round(2)
+    playing_time_warning = pd.Series("", index=work.index, dtype="string")
+    low_minutes_mask = current_minutes_flag & work["expected_fantasy_points"].ge(4) & expected_minutes_probability.lt(0.4)
+    gk_low_minutes_mask = goalie & current_minutes_flag & work["expected_fantasy_points"].ge(3) & (
+        current_minutes_last.le(0) | current_starts_total.le(0)
+    )
+    playing_time_warning.loc[low_minutes_mask] = "low current minutes"
+    playing_time_warning.loc[gk_low_minutes_mask & playing_time_warning.eq("")] = "GK has no recent minutes/start"
+    playing_time_warning.loc[gk_low_minutes_mask & playing_time_warning.ne("")] = (
+        playing_time_warning.loc[gk_low_minutes_mask & playing_time_warning.ne("")] + "; GK has no recent minutes/start"
+    )
+    work["expected_minutes_probability"] = expected_minutes_probability
+    work["expected_start_probability"] = expected_start_probability
+    work["expected_playing_time_warning"] = playing_time_warning
+    for column in [
+        "expected_appearance_points",
+        "expected_goal_points",
+        "expected_assist_points",
+        "expected_clean_sheet_points",
+        "expected_saves_points",
+        "expected_defensive_bonus_points",
+        "expected_card_penalty",
+        "expected_scouting_bonus_points",
+        "expected_minutes_probability",
+        "expected_start_probability",
+        "expected_misc_points",
+        "expected_fantasy_points_base",
+        "expected_fantasy_points",
+    ]:
+        work[column] = pd.to_numeric(work[column], errors="coerce").fillna(0)
+    return work
+
+
 def build_risk_notes(row: pd.Series) -> str:
     risks: list[str] = []
     starter_category = row.get("starting_likelihood_category", "Unknown")
@@ -1377,6 +1685,8 @@ def build_risk_notes(row: pd.Series) -> str:
 
 def export_rankings(scored: pd.DataFrame, output_dir: Path) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Keep this allowlist in sync with the scored DataFrame so transparent
+    # columns like expected fantasy points do not disappear from the CSV export.
     export_columns = [
         "Player",
         "Position",
@@ -1404,6 +1714,26 @@ def export_rankings(scored: pd.DataFrame, output_dir: Path) -> dict[str, Path]:
         "bd_xgot",
         "bd_injury_status",
         "bd_injury_description",
+        "bd_minutes_total",
+        "bd_matches_played",
+        "bd_starts_total",
+        "bd_minutes_last_match",
+        "bd_started_last_match",
+        "bd_appearance_rate",
+        "bd_start_rate",
+        "bd_has_current_minutes_data",
+        "expected_fantasy_points",
+        "expected_appearance_points",
+        "expected_minutes_probability",
+        "expected_start_probability",
+        "expected_goal_points",
+        "expected_assist_points",
+        "expected_clean_sheet_points",
+        "expected_saves_points",
+        "expected_defensive_bonus_points",
+        "expected_card_penalty",
+        "expected_scouting_bonus_points",
+        "expected_playing_time_warning",
         "bd_lineup_rows",
         "bd_matches_in_stats",
         "bd_shots",
@@ -1703,8 +2033,44 @@ def write_report(
     risk_rows = report_frame.loc[risk_mask].sort_values(
         ["_risk_score", "Final score"], ascending=[False, False]
     ).head(15)
+    expected_rows = report_frame.sort_values(["expected_fantasy_points", "Final score"], ascending=False).head(10)
+    expected_value_rows = report_frame.loc[pd.to_numeric(report_frame.get("Price"), errors="coerce").fillna(0) > 0].sort_values(
+        ["_expected_points_value", "expected_fantasy_points"], ascending=False
+    ).head(10)
+    expected_warning_rows = report_frame.loc[
+        report_frame["expected_playing_time_warning"].astype("string").fillna("").ne("")
+    ].sort_values(["expected_fantasy_points", "Final score"], ascending=False).head(10)
     parts.extend(
         [
+            "",
+            "## Expected fantasy points",
+            "",
+            "### Top 10 expected fantasy points",
+            "",
+            markdown_table(expected_rows, EXPECTED_REPORT_COLUMNS, 10),
+            "",
+            "### Top 10 expected fantasy points per price",
+            "",
+            markdown_table(expected_value_rows, EXPECTED_REPORT_COLUMNS, 10),
+            "",
+            "### Playing-time warnings",
+            "",
+            markdown_table(
+                expected_warning_rows,
+                [
+                    "Player",
+                    "Position",
+                    "Team",
+                    "Price",
+                    "Expected fantasy points",
+                    "expected_minutes_probability",
+                    "expected_start_probability",
+                    "bd_minutes_last_match",
+                    "bd_starts_total",
+                    "expected_playing_time_warning",
+                ],
+                10,
+            ),
             "",
             "## Highest-Risk Players",
             "",
@@ -1735,6 +2101,8 @@ def add_report_metrics(report_frame: pd.DataFrame) -> pd.DataFrame:
 
     # Best value is intentionally simple and transparent: final score per price.
     out["_report_value"] = (final_score / price).fillna(0)
+    expected_points = pd.to_numeric(out.get("expected_fantasy_points", pd.Series(0, index=out.index)), errors="coerce").fillna(0)
+    out["_expected_points_value"] = (expected_points / price).fillna(0)
 
     out["_low_starting_likelihood"] = starting.lt(0.55)
     out["_difficult_fixture"] = difficulty.ge(4).fillna(False)
@@ -1941,6 +2309,7 @@ def run_pipeline(
     alias_file: Path | None = Path("config/team_aliases.csv"),
     team_strength_csv: Path | None = None,
     balldontlie_features_csv: Path | None = None,
+    scoring_rules_path: Path | None = Path("config/fantasy_scoring_rules.json"),
     download_missing: bool = True,
     overwrite_downloads: bool = False,
 ) -> dict[str, Any]:
@@ -1974,7 +2343,8 @@ def run_pipeline(
     strength = load_strength(raw_dir, team_strength_csv=team_strength_csv)
     contextual = attach_context(players, fixtures, strength)
     contextual = attach_balldontlie_features(contextual, balldontlie_features_csv)
-    scored = score_players(contextual)
+    scoring_rules = load_scoring_rules(scoring_rules_path)
+    scored = score_players(contextual, scoring_rules=scoring_rules)
     ranking_paths = export_rankings(scored, output_dir)
     report_path = write_report(
         scored,
@@ -2010,6 +2380,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--team-aliases", type=Path, default=Path("config/team_aliases.csv"), help="CSV with alias,canonical columns for team-name normalization.")
     parser.add_argument("--team-strength-csv", type=Path, help="Optional CSV with team, strength_score, and optional match/team projection columns.")
     parser.add_argument("--balldontlie-features", type=Path, help="Optional CSV with BALLDONTLIE player_live_features.csv enrichment.")
+    parser.add_argument("--scoring-rules", type=Path, default=Path("config/fantasy_scoring_rules.json"), help="Optional JSON file with fantasy scoring rules for expected fantasy points.")
     # --as-of is the rolling mode: matches before this timestamp are treated as
     # played, and each player gets the next unplayed fixture for their team.
     parser.add_argument("--as-of", help="Fixture cutoff timestamp, for example 2026-06-18 or 2026-06-18T12:00:00Z.")
@@ -2034,6 +2405,7 @@ def main() -> int:
         alias_file=args.team_aliases,
         team_strength_csv=args.team_strength_csv,
         balldontlie_features_csv=args.balldontlie_features,
+        scoring_rules_path=args.scoring_rules,
         download_missing=not args.no_download,
         overwrite_downloads=args.overwrite_downloads,
     )
