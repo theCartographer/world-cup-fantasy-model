@@ -36,6 +36,8 @@ BDL_REPORT_COLUMNS = [
     "Position",
     "balldontlie_player_id",
     "live_form_score",
+    "bd_live_form_adjustment",
+    "bd_injury_penalty",
     "bd_minutes",
     "bd_starts",
     "bd_goals",
@@ -43,6 +45,7 @@ BDL_REPORT_COLUMNS = [
     "bd_xg",
     "bd_xgot",
     "bd_injury_status",
+    "bd_injury_description",
 ]
 
 STARTING_LIKELIHOOD = {
@@ -1118,9 +1121,12 @@ def attach_context(players: pd.DataFrame, fixtures: pd.DataFrame, strength: pd.D
 
 def score_players(players: pd.DataFrame) -> pd.DataFrame:
     out = players.copy()
-    BDL_LIVE_FORM_WEIGHT = 2.0
-    BDL_OUT_INJURY_PENALTY = 2.5
-    BDL_ACTIVE_INJURY_PENALTY = 1.0
+    # First-pass BALLDONTLIE enrichment only: keep the signal bounded so it can
+    # nudge the ranking without overpowering the open-data baseline.
+    BALLDONTLIE_MAX_BONUS = 1.5
+    BALLDONTLIE_MAX_PENALTY = 1.5
+    BALLDONTLIE_OUT_PENALTY = 1.5
+    BALLDONTLIE_ACTIVE_INJURY_PENALTY = 0.75
 
     numeric_defaults = {
         "goals_per90": 0,
@@ -1253,22 +1259,35 @@ def score_players(players: pd.DataFrame) -> pd.DataFrame:
         out["current_form_raw"] = 0
     out["current_form_score"] = minmax_by_position(out, "current_form_raw").fillna(0.5)
 
+    bd_adjustment = pd.Series(0.0, index=out.index)
+    has_balldontlie = False
     if "live_form_score" in out.columns:
         live_form = pd.to_numeric(out["live_form_score"], errors="coerce")
         out["bd_live_form_signal"] = minmax(live_form).fillna(0.5)
-    else:
-        out["bd_live_form_signal"] = 0.5
+        has_balldontlie = True
+    if "bd_live_form_signal" in out.columns:
+        out["bd_live_form_bonus"] = ((out["bd_live_form_signal"] - 0.5) * 2.0).clip(-1, 1) * BALLDONTLIE_MAX_BONUS
 
     if "bd_injury_status" in out.columns:
         injury_text = out["bd_injury_status"].astype("string").str.strip().str.lower()
+        out["bd_injury_penalty"] = 0.0
+        has_balldontlie = True
     else:
         injury_text = pd.Series("", index=out.index, dtype="string")
 
     active_injury_mask = injury_text.notna() & ~injury_text.isin({"", "nan", "none", "available", "fit", "active", "healthy"})
-    out["bd_injury_penalty"] = 0.0
-    out.loc[active_injury_mask, "bd_injury_penalty"] = BDL_ACTIVE_INJURY_PENALTY
-    out.loc[injury_text.str.contains("out", na=False), "bd_injury_penalty"] = BDL_OUT_INJURY_PENALTY
-    out["bd_live_form_adjustment"] = (BDL_LIVE_FORM_WEIGHT * (out["bd_live_form_signal"] - 0.5)) - out["bd_injury_penalty"]
+    if has_balldontlie:
+        if "bd_injury_penalty" not in out.columns:
+            out["bd_injury_penalty"] = 0.0
+        out.loc[active_injury_mask, "bd_injury_penalty"] = BALLDONTLIE_ACTIVE_INJURY_PENALTY
+        out.loc[injury_text.str.contains("out", na=False), "bd_injury_penalty"] = BALLDONTLIE_OUT_PENALTY
+        if "bd_live_form_bonus" not in out.columns:
+            out["bd_live_form_bonus"] = 0.0
+        out["bd_live_form_adjustment"] = (out["bd_live_form_bonus"] - out["bd_injury_penalty"]).clip(
+            lower=-BALLDONTLIE_MAX_PENALTY,
+            upper=BALLDONTLIE_MAX_BONUS,
+        )
+        bd_adjustment = out["bd_live_form_adjustment"].fillna(0)
 
     out["pre_penalty_score"] = (
         100
@@ -1281,12 +1300,12 @@ def score_players(players: pd.DataFrame) -> pd.DataFrame:
             + 0.05 * out["current_form_score"]
         )
     )
-    out["pre_penalty_score"] = out["pre_penalty_score"] + out["bd_live_form_adjustment"].fillna(0)
+    out["pre_penalty_score"] = out["pre_penalty_score"] + bd_adjustment
     out["fantasy_shortlist_score"] = (out["pre_penalty_score"] * out["starting_penalty"]).round(2)
-    out["final_score"] = out["fantasy_shortlist_score"]
+    out["final_score"] = (out["fantasy_shortlist_score"] + bd_adjustment).round(2)
 
     out["risk_notes"] = out.apply(build_risk_notes, axis=1)
-    return out.sort_values(["fantasy_shortlist_score", "fixture_score", "minutes_score"], ascending=False)
+    return out.sort_values(["final_score", "fantasy_shortlist_score", "fixture_score", "minutes_score"], ascending=False)
 
 
 def classify_starting_likelihood(value: Any) -> str:
@@ -1391,6 +1410,9 @@ def export_rankings(scored: pd.DataFrame, output_dir: Path) -> dict[str, Path]:
         "bd_shots_on_target",
         "bd_yellow_cards",
         "bd_red_cards",
+        "bd_live_form_bonus",
+        "bd_live_form_adjustment",
+        "bd_injury_penalty",
         "fantasy_price",
         "fantasy_price_original",
         "fantasy_price_source",
@@ -1473,7 +1495,12 @@ def build_export_frame(scored: pd.DataFrame) -> pd.DataFrame:
 
 def markdown_table(df: pd.DataFrame, columns: list[str], limit: int) -> str:
     subset = df.head(limit).copy()
-    subset = subset[[col for col in columns if col in subset.columns]]
+    visible_columns: list[str] = []
+    for col in columns:
+        if col not in subset.columns or col in visible_columns:
+            continue
+        visible_columns.append(col)
+    subset = subset[visible_columns]
     if subset.empty:
         return "_No rows available._"
     headers = list(subset.columns)
@@ -1485,6 +1512,9 @@ def markdown_table(df: pd.DataFrame, columns: list[str], limit: int) -> str:
         values = []
         for col in headers:
             value = row[col]
+            if isinstance(value, pd.Series):
+                non_null = value.dropna()
+                value = non_null.iloc[0] if not non_null.empty else ""
             if isinstance(value, float):
                 value = round(value, 2)
             if pd.isna(value):
@@ -1543,7 +1573,33 @@ def write_report(
     warning_lines = build_team_match_warning_lines(report_frame, fixtures)
     strength_warning_lines = build_team_strength_warning_lines(report_frame, strength, team_strength_csv)
     bdl_used = balldontlie_features_csv is not None
-    bdl_lines = build_balldontlie_feature_lines(balldontlie_features_csv, scored) if bdl_used else []
+    bdl_lines: list[str] = []
+    bdl_positive = pd.DataFrame()
+    bdl_negative = pd.DataFrame()
+    bdl_injuries = pd.DataFrame()
+    if bdl_used:
+        matched_mask = report_frame["balldontlie_player_id"].notna() if "balldontlie_player_id" in report_frame.columns else pd.Series(False, index=report_frame.index)
+        matched = int(matched_mask.sum())
+        total = len(report_frame)
+        unmatched = total - matched
+        match_rate = (matched / total) if total else 0.0
+        bdl_lines = [
+            f"- Ranked players matched to BALLDONTLIE features: `{matched}` / `{total}` ({match_rate:.1%})",
+            f"- Unmatched ranked players: `{unmatched}`",
+            "- Optional player-level BALLDONTLIE enrichment is layered on top of the open/static baseline.",
+            "- `live_form_score` is a first-pass signal and should not be treated as the final ranking model.",
+        ]
+
+        if "bd_live_form_adjustment" in report_frame.columns:
+            bdl_positive = report_frame.loc[matched_mask].sort_values("bd_live_form_adjustment", ascending=False).head(10)
+            bdl_negative = report_frame.loc[matched_mask].sort_values("bd_live_form_adjustment", ascending=True).head(10)
+        if "bd_injury_status" in report_frame.columns:
+            injury_text = report_frame["bd_injury_status"].astype("string").str.strip().str.lower()
+            active_mask = matched_mask & injury_text.notna() & injury_text.ne("") & ~injury_text.isin({"nan", "none", "available", "fit", "active", "healthy"})
+            bdl_injuries = report_frame.loc[active_mask].sort_values(
+                ["bd_injury_penalty", "bd_live_form_adjustment"],
+                ascending=[False, True],
+            ).head(10)
     parts = [
         "# FIFA World Cup Fantasy Shortlist",
         "",
@@ -1583,7 +1639,17 @@ def write_report(
                 "",
                 *bdl_lines,
                 "",
-                markdown_table(report_frame, BDL_REPORT_COLUMNS, 10),
+                "### Top Positive BALLDONTLIE Adjustments",
+                "",
+                markdown_table(bdl_positive, BDL_REPORT_COLUMNS, 10),
+                "",
+                "### Top Negative BALLDONTLIE Adjustments",
+                "",
+                markdown_table(bdl_negative, BDL_REPORT_COLUMNS, 10),
+                "",
+                "### Active BALLDONTLIE Injuries",
+                "",
+                markdown_table(bdl_injuries, BDL_REPORT_COLUMNS, 10),
             ]
         )
 

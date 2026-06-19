@@ -63,6 +63,14 @@ To include those optional features in rankings, pass the enrichment CSV:
 python scripts/build_rankings.py --fixture-csv data/raw/world-cup_2026.csv --current-export "C:\Users\micha\Downloads\fantasy_football_players.txt" --target-round 2 --team-aliases config/team_aliases.csv --balldontlie-features data/processed/balldontlie/player_live_features.csv --report-md outputs/matchday_2_report.md
 ```
 
+To compare a baseline run with an enriched run, save them to separate output folders and then compare the CSVs:
+
+```powershell
+python scripts/build_rankings.py --fixture-csv data/raw/world-cup_2026.csv --current-export "C:\Users\micha\Downloads\fantasy_football_players.txt" --target-round 2 --team-aliases config/team_aliases.csv --output-dir output/baseline
+python scripts/build_rankings.py --fixture-csv data/raw/world-cup_2026.csv --current-export "C:\Users\micha\Downloads\fantasy_football_players.txt" --target-round 2 --team-aliases config/team_aliases.csv --balldontlie-features data/processed/balldontlie/player_live_features.csv --output-dir output/enriched
+python scripts/compare_rankings.py --baseline-csv output/baseline/player_rankings_all.csv --enriched-csv output/enriched/player_rankings_all.csv
+```
+
 With a current fantasy export. CSV exports are supported, and copied FIFA Fantasy
 player-list TXT exports like `Player / Total pts / Action` blocks are parsed too:
 
