@@ -16,3 +16,4 @@ data/processed/balldontlie/
 
 # keep config files
 !config/team_aliases.csv
+data/manual/
