@@ -1,0 +1,16 @@
+player,team,position,squad_role,bench_order,is_captain,is_vice_captain,locked,notes
+Vargas,Colombia,GK,XI,,false,false,true,
+João Cancelo,Portugal,DEF,XI,,false,false,true,
+Pedro Porro,Spain,DEF,XI,,false,false,true,
+Muñoz,Colombia,DEF,XI,,false,false,true,
+Boulbina,Algeria,MID,XI,,false,false,true,
+Bruno Fernandes,Portugal,MID,XI,,true,false,true,captain
+Neymar,Brazil,MID,XI,,false,true,true,vice captain
+Raphinha,Brazil,MID,XI,,false,false,true,
+Dani Olmo,Spain,MID,XI,,false,false,true,
+Kylian Mbappé,France,FWD,XI,,false,false,true,
+Harry Kane,England,FWD,XI,,false,false,true,
+Rochet,Uruguay,GK,BENCH,1,false,false,true,bench goalkeeper
+Nico O'Reilly,England,DEF,BENCH,2,false,false,true,
+Cristian Romero,Argentina,DEF,BENCH,3,false,false,true,
+Suárez,Colombia,FWD,BENCH,4,false,false,true,

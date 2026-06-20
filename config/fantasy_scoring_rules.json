@@ -1,0 +1,43 @@
+{
+  "appearance": {
+    "up_to_60": 1,
+    "sixty_plus": 1
+  },
+  "goals": {
+    "GK": 9,
+    "DEF": 7,
+    "MID": 6,
+    "FWD": 5
+  },
+  "assist": 3,
+  "clean_sheet": {
+    "GK": 5,
+    "DEF": 5,
+    "MID": 1,
+    "FWD": 0
+  },
+  "saves": {
+    "gk_every_3": 1,
+    "gk_penalty_save": 3
+  },
+  "cards": {
+    "yellow": -1,
+    "red": -2,
+    "own_goal": -2
+  },
+  "penalties": {
+    "won": 2,
+    "conceded": -1
+  },
+  "direct_free_kick_goal": 1,
+  "scouting_bonus": {
+    "threshold_points": 4,
+    "threshold_selected_pct": 5,
+    "bonus": 2
+  },
+  "defensive_bonus": {
+    "mid_tackles_every": 3,
+    "mid_chances_created_every": 2,
+    "fwd_shots_on_target_every": 2
+  }
+}

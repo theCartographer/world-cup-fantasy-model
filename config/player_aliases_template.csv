@@ -1,0 +1,27 @@
+alias,team,position,canonical_player
+Vargas,Colombia,GK,Camilo Vargas
+Camilo Vargas,Colombia,GK,Camilo Vargas
+Rochet,Uruguay,GK,Sergio Rochet
+Sergio Rochet,Uruguay,GK,Sergio Rochet
+Boulbina,Algeria,MID,Adil Boulbina
+Adil Boulbina,Algeria,MID,Adil Boulbina
+Muñoz,Colombia,DEF,Daniel Muñoz
+Munoz,Colombia,DEF,Daniel Muñoz
+Daniel Muñoz,Colombia,DEF,Daniel Muñoz
+O'Reilly,England,DEF,Nico O'Reilly
+Nico O'Reilly,England,DEF,Nico O'Reilly
+Suárez,Colombia,FWD,Luis Suárez
+Suarez,Colombia,FWD,Luis Suárez
+Luis Suárez,Colombia,FWD,Luis Suárez
+Raphinha,Brazil,MID,Raphinha
+Raphael Dias Belloli,Brazil,MID,Raphinha
+Neymar,Brazil,MID,Neymar
+Dani Olmo,Spain,MID,Dani Olmo
+Pedro Porro,Spain,DEF,Pedro Porro
+Cristian Romero,Argentina,DEF,Cristian Romero
+Bruno Fernandes,Portugal,MID,Bruno Fernandes
+João Cancelo,Portugal,DEF,João Cancelo
+Joao Cancelo,Portugal,DEF,João Cancelo
+Kylian Mbappé,France,FWD,Kylian Mbappé
+Kylian Mbappe,France,FWD,Kylian Mbappé
+Harry Kane,England,FWD,Harry Kane

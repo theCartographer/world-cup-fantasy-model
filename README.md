@@ -76,12 +76,21 @@ python scripts/compare_rankings.py --baseline-csv output/baseline/player_ranking
 - BALLDONTLIE enrichment is optional. If you do not pass `--balldontlie-features`, the open/static-data model remains the baseline.
 - BALLDONTLIE player stats can include historical context depending on endpoint coverage, so they are not guaranteed to reflect only current 2026 World Cup live form.
 - `live_form_score` is a first-pass enrichment signal, not the final fantasy answer.
+- The current feature builder filters current/recent BALLDONTLIE rows to valid 2026 World Cup matches only, so historical or unmatched `match_id` rows are ignored.
 - Use `scripts/compare_rankings.py` to see how much the enriched rankings move from the baseline before trusting the adjustment.
 - Review injury status manually before making final fantasy decisions.
 
 ## Current Squad Workflow
 
 Copy [`config/current_squad_template.csv`](/C:/Users/micha/OneDrive/Documents/Fantasy%20Football/config/current_squad_template.csv) to `data/manual/current_squad.csv`, then edit it whenever your fantasy squad changes.
+
+```powershell
+Copy-Item config/current_squad_template.csv data/manual/current_squad.csv
+```
+
+If your squad export uses nicknames or shortened names, you can also copy
+[`config/player_aliases_template.csv`](/C:/Users/micha/OneDrive/Documents/Fantasy%20Football/config/player_aliases_template.csv)
+to `data/manual/player_aliases.csv` and pass `--player-aliases data/manual/player_aliases.csv` to `pick_xi.py`.
 
 Review the current locked round:
 
@@ -94,6 +103,21 @@ Plan the next round:
 ```powershell
 python scripts/pick_xi.py --rankings-csv output/player_rankings_balldontlie.csv --current-squad-csv data/manual/current_squad.csv --mode plan --formation 3-4-3 --budget 100 --max-per-team 3 --free-transfers 2 --output-md outputs/suggested_xi.md
 ```
+
+`scripts/pick_xi.py` uses `expected_fantasy_points` first when it is available, then
+`final_score` as the tie-breaker and fallback.
+
+## Local Squad Dashboard
+
+Generate a local HTML snapshot of the current squad review:
+
+```powershell
+python scripts/render_squad_report.py --rankings-csv output/player_rankings_all.csv --current-squad-csv data/manual/current_squad.csv --player-aliases data/manual/player_aliases.csv --fixture-csv data/raw/world-cup_2026.csv --output-html outputs/current_squad_dashboard.html
+Start-Process outputs/current_squad_dashboard.html
+```
+
+The dashboard is a read-only HTML view of the matched current squad, captain
+panel, and low-minutes/injury alerts.
 
 With a current fantasy export. CSV exports are supported, and copied FIFA Fantasy
 player-list TXT exports like `Player / Total pts / Action` blocks are parsed too:
