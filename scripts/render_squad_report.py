@@ -94,8 +94,14 @@ def sum_numeric_series(frame: pd.DataFrame, column: str) -> float | None:
     numeric = pd.to_numeric(series, errors="coerce").dropna()
     if numeric.empty:
         return None
-    total = float(numeric.sum())
-    return None if total == 0 else total
+    return float(numeric.sum())
+
+
+def format_optional_integer(value: Any) -> str:
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number):
+        return "N/A"
+    return str(int(number))
 
 
 def text_column(frame: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -154,6 +160,7 @@ def render_table(
     vice_keys: set[str],
     bench: bool = False,
     show_tags: bool = True,
+    header_labels: dict[str, str] | None = None,
 ) -> str:
     if frame is None or frame.empty:
         return "<div class='table-wrap'><div class='empty'>No rows available.</div></div>"
@@ -161,7 +168,8 @@ def render_table(
     headers = columns + (["tags"] if show_tags else [])
     lines = ["<div class='table-wrap'>", "<table class='dashboard-table'>", "<thead><tr>"]
     for header in headers:
-        lines.append(f"<th>{esc(header.replace('_', ' ').title())}</th>")
+        label = header_labels.get(header, header.replace('_', ' ').title()) if header_labels else header.replace('_', ' ').title()
+        lines.append(f"<th>{esc(label)}</th>")
     lines.extend(["</tr></thead>", "<tbody>"])
 
     for _, row in frame.iterrows():
@@ -208,6 +216,20 @@ def render_list(items: list[str]) -> str:
     if not items:
         return "<li class='empty-item'>None</li>"
     return "\n".join(f"<li>{item}</li>" for item in items)
+
+
+def short_player_label(row: pd.Series, fallback: str = "") -> str:
+    player = str(row.get("player", "")).strip()
+    team = str(row.get("team", "")).strip()
+    points = format_number(row.get("expected_fantasy_points"), 1)
+    if not player:
+        player = fallback
+    pieces = [player]
+    if team:
+        pieces.append(team)
+    if points:
+        pieces.append(points)
+    return " - ".join(piece for piece in pieces if piece)
 
 
 def safe_captain_pool(xi: pd.DataFrame, captain_threshold: float) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -273,6 +295,203 @@ def format_alert_items(current: pd.DataFrame, low_minutes_threshold: float, capt
         alerts["unmatched"] = [f"{row['player']} ({row.get('match_quality', '')})" for _, row in unmatched.iterrows()]
 
     return alerts
+
+
+def build_takeaways_section(
+    current: pd.DataFrame,
+    xi: pd.DataFrame,
+    bench: pd.DataFrame,
+    safe_candidates: pd.DataFrame,
+    low_minutes_threshold: float,
+    captain_threshold: float,
+) -> str:
+    captain = current.loc[current["is_captain"]].copy()
+    vice = current.loc[current["is_vice_captain"]].copy()
+    safe_captain = safe_candidates.head(1)
+    best_bench = bench.sort_values(
+        ["expected_fantasy_points", "expected_minutes_probability", "selection_score", "selection_final_score"],
+        ascending=[False, False, False, False],
+        na_position="last",
+    ).head(3)
+    xi_minutes = pd.to_numeric(get_series(xi, "expected_minutes_probability"), errors="coerce").fillna(0)
+    low_xi = xi.loc[xi_minutes.lt(low_minutes_threshold)]
+    injury_xi = xi.loc[pd.to_numeric(get_series(xi, "bd_injury_penalty"), errors="coerce").fillna(0) > 0]
+    risk_rank = xi.copy()
+    risk_rank["risk_score"] = (
+        (pd.to_numeric(get_series(risk_rank, "bd_injury_penalty"), errors="coerce").fillna(0) > 0).astype(int) * 3
+        + (pd.to_numeric(get_series(risk_rank, "expected_minutes_probability"), errors="coerce").fillna(1) < low_minutes_threshold).astype(int) * 2
+        + pd.to_numeric(get_series(risk_rank, "fixture_difficulty"), errors="coerce").fillna(0)
+    )
+    worst_xi = risk_rank.sort_values(
+        ["risk_score", "expected_fantasy_points", "expected_minutes_probability"],
+        ascending=[False, True, True],
+        na_position="last",
+    ).head(3)
+
+    captain_label = "No captain assigned"
+    if not captain.empty:
+        captain_row = captain.iloc[0]
+        captain_label = short_player_label(captain_row)
+    vice_label = "No vice captain assigned"
+    if not vice.empty:
+        vice_label = short_player_label(vice.iloc[0])
+    safe_label = "No safe captain candidates"
+    if not safe_captain.empty:
+        safe_label = short_player_label(safe_captain.iloc[0])
+
+    captain_minutes = pd.to_numeric(get_series(captain, "expected_minutes_probability"), errors="coerce")
+    captain_status = captain_label if captain.empty else f"{captain_label} ({format_optional_number(captain_minutes.iloc[0] if not captain_minutes.empty else pd.NA, 2)})"
+    vice_minutes = pd.to_numeric(get_series(vice, "expected_minutes_probability"), errors="coerce")
+    vice_status = vice_label if vice.empty else f"{vice_label} ({format_optional_number(vice_minutes.iloc[0] if not vice_minutes.empty else pd.NA, 2)})"
+    body = "\n".join(
+        [
+            "<ul class='takeaway-list'>",
+            f"<li><strong>Best safe captain:</strong> {esc(safe_label)}</li>",
+            f"<li><strong>Current captain:</strong> {esc(captain_status)}</li>",
+            f"<li><strong>Current vice captain:</strong> {esc(vice_status)}</li>",
+            f"<li><strong>Low-minutes XI players:</strong> {esc(', '.join(low_xi['player'].astype(str).tolist()) if not low_xi.empty else 'None')}</li>",
+            f"<li><strong>Injury-risk players:</strong> {esc(', '.join(injury_xi['player'].astype(str).tolist()) if not injury_xi.empty else 'None')}</li>",
+            f"<li><strong>Best bench options:</strong> {esc(', '.join(best_bench['player'].astype(str).tolist()) if not best_bench.empty else 'None')}</li>",
+            f"<li><strong>Worst current XI risk:</strong> {esc(', '.join(worst_xi['player'].astype(str).tolist()) if not worst_xi.empty else 'None')}</li>",
+            "</ul>",
+        ]
+    )
+    return render_section("Immediate Squad Takeaways", body)
+
+
+def build_transfer_watchlist(
+    current: pd.DataFrame,
+    rankings: pd.DataFrame,
+    low_minutes_threshold: float,
+) -> str:
+    if current is None or current.empty:
+        return render_section("Transfer Watchlist", "<div class='empty'>No current squad available.</div>")
+
+    current = selection_metric(current)
+    rankings = selection_metric(rankings)
+    current_keys = set(current["match_key"].astype(str)) if "match_key" in current.columns else set()
+
+    sell_frame = current.copy()
+    sell_frame["watch_minutes"] = pd.to_numeric(get_series(sell_frame, "expected_minutes_probability"), errors="coerce").fillna(0)
+    sell_frame["watch_injury"] = pd.to_numeric(get_series(sell_frame, "bd_injury_penalty"), errors="coerce").fillna(0)
+    sell_frame["watch_points"] = pd.to_numeric(get_series(sell_frame, "expected_fantasy_points"), errors="coerce").fillna(0)
+    sell_frame["watch_fixture"] = pd.to_numeric(get_series(sell_frame, "fixture_difficulty"), errors="coerce").fillna(0)
+    sell_frame["watch_score"] = (
+        (sell_frame["squad_role"].eq("BENCH").astype(int) * 2)
+        + (sell_frame["watch_minutes"].lt(low_minutes_threshold).astype(int) * 3)
+        + (sell_frame["watch_injury"].gt(0).astype(int) * 4)
+        + sell_frame["watch_fixture"].fillna(0)
+        - sell_frame["watch_points"].fillna(0) / 10.0
+    )
+    sell_frame = sell_frame.sort_values(
+        ["watch_score", "watch_minutes", "watch_points", "price"],
+        ascending=[False, True, True, True],
+        na_position="last",
+    )
+    sell_table = sell_frame.loc[:, [
+        "player",
+        "team",
+        "position",
+        "price",
+        "expected_fantasy_points",
+        "expected_minutes_probability",
+        "fixture_difficulty",
+        "bd_injury_penalty",
+        "risk_note",
+    ]].head(5).copy()
+
+    sell_positions = sell_table["position"].astype(str).str.upper().tolist()
+    buy_pool = rankings.loc[~rankings["match_key"].astype(str).isin(current_keys)].copy()
+    same_position_pool = buy_pool.loc[buy_pool["position"].astype(str).str.upper().isin(sell_positions)].copy()
+    if not same_position_pool.empty:
+        buy_pool = same_position_pool
+    buy_pool["buy_minutes"] = pd.to_numeric(get_series(buy_pool, "expected_minutes_probability"), errors="coerce").fillna(0)
+    buy_pool["buy_injury"] = pd.to_numeric(get_series(buy_pool, "bd_injury_penalty"), errors="coerce").fillna(0)
+    buy_pool["buy_points"] = pd.to_numeric(get_series(buy_pool, "expected_fantasy_points"), errors="coerce").fillna(0)
+    buy_pool["buy_price"] = pd.to_numeric(get_series(buy_pool, "price"), errors="coerce")
+    buy_pool = buy_pool.loc[buy_pool["buy_minutes"].ge(low_minutes_threshold)]
+    buy_pool = buy_pool.sort_values(
+        ["buy_points", "buy_minutes", "final_score", "buy_price"],
+        ascending=[False, False, False, True],
+        na_position="last",
+    )
+    buy_table = buy_pool.loc[:, [
+        "player",
+        "team",
+        "position",
+        "price",
+        "expected_fantasy_points",
+        "expected_minutes_probability",
+        "fixture_difficulty",
+        "bd_injury_penalty",
+        "risk_note",
+    ]].head(8).copy()
+
+    if sell_table.empty:
+        sell_html = "<div class='empty'>No obvious sell candidates found.</div>"
+    else:
+        sell_html = render_table(
+            sell_table,
+            list(sell_table.columns),
+            low_minutes_threshold,
+            set(),
+            set(),
+            show_tags=False,
+            header_labels={
+                "expected_fantasy_points": "exp_pts",
+                "expected_minutes_probability": "min_prob",
+                "risk_note": "risk",
+            },
+        )
+    if buy_table.empty:
+        buy_html = "<div class='empty'>No obvious buy candidates found.</div>"
+    else:
+        buy_html = render_table(
+            buy_table,
+            list(buy_table.columns),
+            low_minutes_threshold,
+            set(),
+            set(),
+            show_tags=False,
+            header_labels={
+                "expected_fantasy_points": "exp_pts",
+                "expected_minutes_probability": "min_prob",
+                "risk_note": "risk",
+            },
+        )
+
+    note = (
+        "This watchlist is a directional shortlist, not a final transfer plan. "
+        "When planning transfers, prefer same-position swaps and keep an eye on budget and max-per-team limits."
+    )
+    body = "\n".join(
+        [
+            f"<p>{esc(note)}</p>",
+            "<h3>Sell Candidates</h3>",
+            sell_html,
+            "<h3>Buy Candidates</h3>",
+            buy_html,
+        ]
+    )
+    return render_section("Transfer Watchlist", body)
+
+
+def build_planning_hint_section() -> str:
+    plan_md = Path("outputs/transfer_plan.md")
+    plan_csv = Path("output/transfer_plan.csv")
+    lines = [
+        "Transfer planning should be generated when the round is open.",
+        "Suggested command:",
+        "python scripts/plan_transfers.py --rankings-csv output/player_rankings_all.csv --current-squad-csv data/manual/current_squad.csv --player-aliases data/manual/player_aliases.csv --max-transfers 10 --output-md outputs/transfer_plan.md --output-csv output/transfer_plan.csv",
+    ]
+    if plan_md.exists() or plan_csv.exists():
+        lines.append("")
+        lines.append("Existing outputs detected:")
+        if plan_md.exists():
+            lines.append(f"- {plan_md} (last modified: {file_timestamp(plan_md)})")
+        if plan_csv.exists():
+            lines.append(f"- {plan_csv} (last modified: {file_timestamp(plan_csv)})")
+    return render_section("Transfer Planning", "\n".join(f"<p>{esc(line)}</p>" for line in lines))
 
 
 def render_section(title: str, body: str) -> str:
@@ -409,6 +628,7 @@ def build_freshness_section(
 
 def build_html(
     current: pd.DataFrame,
+    rankings: pd.DataFrame,
     rankings_csv: Path,
     current_squad_csv: Path,
     player_aliases_csv: Path | None,
@@ -428,33 +648,26 @@ def build_html(
     total_value = sum_numeric_series(matched_current, "price")
     xi_points = sum_numeric_series(xi, "expected_fantasy_points")
     bench_points = sum_numeric_series(bench, "expected_fantasy_points")
+    risk_count = int(current["risk_note"].astype("string").str.strip().ne("").sum()) if "risk_note" in current.columns else None
     generated = datetime.now().astimezone().isoformat(timespec="seconds")
     captain_keys = set(captain["match_key"].astype(str)) if not captain.empty else set()
     vice_keys = set(vice["match_key"].astype(str)) if not vice.empty else set()
     alerts = format_alert_items(current, low_minutes_threshold, captain_threshold)
 
-    stats = [
-        ("Total Squad Value", format_optional_number(total_value, 1)),
-        ("Projected XI Expected Points", format_optional_number(xi_points, 1)),
-        ("Projected Bench Expected Points", format_optional_number(bench_points, 1)),
-    ]
-
-    stats_html = "".join(
-        f"<div class='stat'><div class='stat-label'>{esc(label)}</div><div class='stat-value'>{esc(value)}</div></div>"
-        for label, value in stats
-    )
-
     alert_html = f"""
-    <div class='alert-grid'>
-      <div class='alert-card'><h3>XI players below low minutes threshold</h3><ul>{render_list(alerts['xi_low_minutes'])}</ul></div>
-      <div class='alert-card'><h3>Bench players below low minutes threshold</h3><ul>{render_list(alerts['bench_low_minutes'])}</ul></div>
-      <div class='alert-card'><h3>Injury penalty players</h3><ul>{render_list(alerts['injuries'])}</ul></div>
-      <div class='alert-card'><h3>Unmatched / ambiguous players</h3><ul>{render_list(alerts['unmatched'])}</ul></div>
-      <div class='alert-card'><h3>Captain warning</h3><ul>{render_list(alerts['captain'])}</ul></div>
-    </div>
+    <h3>XI players below low minutes threshold</h3>
+    <ul>{render_list(alerts['xi_low_minutes'])}</ul>
+    <h3>Bench players below low minutes threshold</h3>
+    <ul>{render_list(alerts['bench_low_minutes'])}</ul>
+    <h3>Injury penalty players</h3>
+    <ul>{render_list(alerts['injuries'])}</ul>
+    <h3>Unmatched / ambiguous players</h3>
+    <ul>{render_list(alerts['unmatched'])}</ul>
+    <h3>Captain warning</h3>
+    <ul>{render_list(alerts['captain'])}</ul>
     """
 
-    compact_columns = [
+    xi_columns = [
         "player",
         "team",
         "position",
@@ -464,25 +677,56 @@ def build_html(
         "opponent",
         "risk_note",
     ]
-    bench_columns = compact_columns + ["bench_order"]
-    current_captain_html = render_table(captain, compact_columns, low_minutes_threshold, captain_keys, vice_keys)
-    current_vice_html = render_table(vice, compact_columns, low_minutes_threshold, captain_keys, vice_keys)
-    safe_html = render_table(safe_candidates.head(5), compact_columns, low_minutes_threshold, captain_keys, vice_keys)
-    risky_html = render_table(risky_candidates.head(10), compact_columns, low_minutes_threshold, captain_keys, vice_keys)
+    bench_columns = xi_columns + ["bench_order"]
+    captain_columns = [
+        "player",
+        "team",
+        "position",
+        "expected_fantasy_points",
+        "expected_minutes_probability",
+        "risk_note",
+    ]
+    takeaways_html = build_takeaways_section(current, xi, bench, safe_candidates, low_minutes_threshold, captain_threshold)
+    watchlist_html = build_transfer_watchlist(current, rankings, low_minutes_threshold)
+    planning_hint_html = build_planning_hint_section()
 
-    xi_html = render_table(xi, compact_columns, low_minutes_threshold, captain_keys, vice_keys)
-    bench_html = render_table(bench, bench_columns, low_minutes_threshold, captain_keys, vice_keys, bench=True)
+    summary_bits = []
+    if total_value is not None:
+        summary_bits.append(f"Squad value: {format_optional_number(total_value, 1)}")
+    if xi_points is not None:
+        summary_bits.append(f"XI expected points: {format_optional_number(xi_points, 1)}")
+    if bench_points is not None:
+        summary_bits.append(f"Bench expected points: {format_optional_number(bench_points, 1)}")
+    if risk_count is not None:
+        summary_bits.append(f"Squad risk count: {format_optional_integer(risk_count)}")
+    summary_line = " | ".join(summary_bits)
+    summary_html = f"<div class='summary-line'>{esc(summary_line)}</div>" if summary_bits else ""
 
+    table_labels = {
+        "expected_fantasy_points": "exp_pts",
+        "expected_minutes_probability": "min_prob",
+        "risk_note": "risk",
+        "bench_order": "bench_order",
+    }
+    current_captain_html = render_table(captain, captain_columns, low_minutes_threshold, captain_keys, vice_keys, header_labels=table_labels)
+    current_vice_html = render_table(vice, captain_columns, low_minutes_threshold, captain_keys, vice_keys, header_labels=table_labels)
+    safe_html = render_table(safe_candidates.head(5), captain_columns, low_minutes_threshold, captain_keys, vice_keys, header_labels=table_labels)
+    risky_html = render_table(risky_candidates.head(10), captain_columns, low_minutes_threshold, captain_keys, vice_keys, header_labels=table_labels)
+
+    xi_html = render_table(xi, xi_columns, low_minutes_threshold, captain_keys, vice_keys, header_labels=table_labels)
+    bench_html = render_table(bench, bench_columns, low_minutes_threshold, captain_keys, vice_keys, bench=True, header_labels=table_labels)
     captain_panel_html = render_section(
         "Captain Panel",
         "\n".join(
             [
-                "<div class='section-grid'>",
-                f"<div><h3>Current Captain</h3>{current_captain_html}</div>",
-                f"<div><h3>Current Vice Captain</h3>{current_vice_html}</div>",
-                f"<div><h3>Top 5 Safe Captain Candidates</h3>{safe_html}</div>",
-                f"<div><h3>High Projection but Risky Captain Options</h3>{risky_html}</div>",
-                "</div>",
+                "<h3>Current Captain</h3>",
+                current_captain_html,
+                "<h3>Current Vice Captain</h3>",
+                current_vice_html,
+                "<h3>Top 5 Safe Captain Candidates</h3>",
+                safe_html,
+                "<h3>High Projection but Risky Captain Options</h3>",
+                risky_html,
             ]
         ),
     )
@@ -490,10 +734,10 @@ def build_html(
         "Squad Summary",
         "\n".join(
             [
-                "<div class='section-grid'>",
-                f"<div><h3>Starting XI</h3>{xi_html}</div>",
-                f"<div><h3>Bench</h3>{bench_html}</div>",
-                "</div>",
+                "<h3>Starting XI</h3>",
+                xi_html,
+                "<h3>Bench</h3>",
+                bench_html,
             ]
         ),
     )
@@ -535,7 +779,7 @@ def build_html(
       font-family: "Segoe UI", Arial, sans-serif;
       line-height: 1.45;
     }
-    .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 18px; }
     .hero {
       background: linear-gradient(135deg, #0f172a 0%, #1f2937 50%, #334155 100%);
       color: #fff;
@@ -545,21 +789,18 @@ def build_html(
     }
     .hero h1 { margin: 0 0 8px 0; font-size: 2rem; }
     .hero .meta { color: rgba(255,255,255,0.8); font-size: 0.95rem; }
-    .stats-grid, .alert-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 12px;
-      margin-top: 16px;
+    .summary-line {
+      margin-top: 12px;
+      color: rgba(255,255,255,0.92);
+      font-size: 0.98rem;
+      font-weight: 600;
     }
-    .stat, .alert-card, .panel {
+    .panel {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 16px;
       box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
     }
-    .stat { padding: 14px 16px; min-width: 0; }
-    .stat-label { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
-    .stat-value { font-size: 1.05rem; margin-top: 4px; font-weight: 700; }
     .panel { margin-top: 18px; overflow: hidden; }
     .panel h2 {
       margin: 0;
@@ -569,20 +810,18 @@ def build_html(
       background: linear-gradient(180deg, #fff 0%, #f8fafc 100%);
     }
     .panel .body { padding: 16px 18px; }
-    .alert-card { padding: 14px 16px; min-width: 0; }
-    .alert-card h3 { margin: 0 0 10px 0; font-size: 0.95rem; }
-    .alert-card ul { margin: 0; padding-left: 18px; color: var(--ink); }
-    .alert-card li { margin-bottom: 6px; }
+    .panel h3 { margin: 16px 0 8px 0; font-size: 0.95rem; }
+    .panel p { margin: 0 0 10px 0; }
+    .panel ul { margin: 0 0 12px 18px; padding: 0; color: var(--ink); }
+    .panel li { margin-bottom: 6px; }
     .empty, .empty-item { color: var(--muted); font-style: italic; }
     .table-wrap {
       max-width: 100%;
       overflow-x: auto;
       overflow-y: hidden;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: #fff;
+      margin: 10px 0 14px 0;
     }
-    table.dashboard-table { width: 100%; min-width: 760px; border-collapse: collapse; }
+    table.dashboard-table { width: 100%; min-width: 760px; border-collapse: collapse; background: #fff; border: 1px solid var(--line); }
     th, td {
       padding: 9px 10px;
       border-bottom: 1px solid var(--line);
@@ -617,8 +856,8 @@ def build_html(
     .badge.neutral { background: var(--neutral); color: var(--neutral-ink); }
     .badge.captain { background: var(--captain); color: var(--captain-ink); }
     .badge.vice { background: var(--vice); color: var(--vice-ink); }
-    .section-grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
-    .two-col { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr); gap: 18px; }
+    .takeaway-list { margin: 0; padding-left: 18px; }
+    .takeaway-list li { margin-bottom: 8px; }
     .refresh-note {
       margin-top: 12px;
       padding: 12px 14px;
@@ -638,15 +877,10 @@ def build_html(
     }
     .recent-block { margin-top: 14px; }
     .recent-block h4 { margin: 0 0 10px 0; font-size: 0.95rem; }
-    @media (max-width: 1000px) {
-      .two-col { grid-template-columns: 1fr; }
-    }
     @media (max-width: 700px) {
       .container { padding: 12px; }
       .hero { padding: 18px; border-radius: 16px; }
       .hero h1 { font-size: 1.55rem; }
-      .stats-grid, .alert-grid { grid-template-columns: 1fr; }
-      .stat, .alert-card { padding: 12px 14px; }
       table.dashboard-table { min-width: 620px; }
     }
     """
@@ -665,17 +899,16 @@ def build_html(
         <div class="hero">
           <h1>Current Squad Dashboard</h1>
           <div class="meta">Generated {esc(generated)}</div>
-          <div class="stats-grid">{stats_html}</div>
+          {summary_html}
         </div>
 
         {render_section("Key Alerts", alert_html)}
-
-        <div class="two-col">
-          {captain_panel_html}
-          {squad_summary_html}
-        </div>
-
+        {takeaways_html}
+        {captain_panel_html}
+        {squad_summary_html}
+        {watchlist_html}
         {freshness_html}
+        {planning_hint_html}
       </div>
     </body>
     </html>
@@ -697,6 +930,7 @@ def main() -> int:
 
     html_text = build_html(
         current,
+        rankings,
         args.rankings_csv,
         args.current_squad_csv,
         args.player_aliases if args.player_aliases and args.player_aliases.exists() else None,

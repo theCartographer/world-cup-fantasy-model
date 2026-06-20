@@ -109,7 +109,8 @@ python scripts/pick_xi.py --rankings-csv output/player_rankings_balldontlie.csv 
 
 ## Local Squad Dashboard
 
-Generate a local HTML snapshot of the current squad review:
+Generate a one-column local HTML snapshot of the current squad review. No server
+is needed:
 
 ```powershell
 python scripts/render_squad_report.py --rankings-csv output/player_rankings_all.csv --current-squad-csv data/manual/current_squad.csv --player-aliases data/manual/player_aliases.csv --fixture-csv data/raw/world-cup_2026.csv --output-html outputs/current_squad_dashboard.html
@@ -117,7 +118,25 @@ Start-Process outputs/current_squad_dashboard.html
 ```
 
 The dashboard is a read-only HTML view of the matched current squad, captain
-panel, and low-minutes/injury alerts.
+panel, low-minutes/injury alerts, recent completed matches, and a built-in
+transfer-plan command note.
+
+## Transfer Planning
+
+Generate a conservative, balanced, or aggressive transfer plan from the same
+matched current squad:
+
+```powershell
+python scripts/plan_transfers.py --rankings-csv output/player_rankings_all.csv --current-squad-csv data/manual/current_squad.csv --player-aliases data/manual/player_aliases.csv --max-transfers 2 --output-md outputs/transfer_plan_conservative.md --output-csv output/transfer_plan_conservative.csv
+python scripts/plan_transfers.py --rankings-csv output/player_rankings_all.csv --current-squad-csv data/manual/current_squad.csv --player-aliases data/manual/player_aliases.csv --max-transfers 5 --output-md outputs/transfer_plan_balanced.md --output-csv output/transfer_plan_balanced.csv
+python scripts/plan_transfers.py --rankings-csv output/player_rankings_all.csv --current-squad-csv data/manual/current_squad.csv --player-aliases data/manual/player_aliases.csv --max-transfers 10 --output-md outputs/transfer_plan_aggressive.md --output-csv output/transfer_plan_aggressive.csv
+```
+
+- Conservative: up to 2 moves.
+- Balanced: up to 5 moves.
+- Aggressive: up to 10 moves, which is useful when a near-full XI rebuild is allowed.
+- The planner keeps `expected_fantasy_points` as the primary ranking signal and uses `final_score` as the tie-breaker.
+- Current round may still be locked, so use these plans when transfers open or at the end of the round.
 
 With a current fantasy export. CSV exports are supported, and copied FIFA Fantasy
 player-list TXT exports like `Player / Total pts / Action` blocks are parsed too:
